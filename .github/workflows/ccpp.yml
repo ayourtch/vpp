@@ -1,0 +1,16 @@
+name: C/C++ CI
+
+on: [push, commit_comment]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-18.04
+    
+    steps:
+    - uses: actions/checkout@v1
+    - name: install
+      run: sudo apt-get install -y curl build-essential autoconf automake ccache debhelper dkms git libtool libapr1-dev dh-systemd libconfuse-dev git-review exuberant-ctags cscope pkg-config lcov chrpath autoconf indent libnuma-dev python-all python3-all python3-setuptools python-dev python-virtualenv python-pip libffi6 check libboost-all-dev libffi-dev python3-ply libmbedtls-dev cmake ninja-build uuid-dev python3-jsonschema
+    - name: make test
+      run: TEST_JOBS=auto make test
+
