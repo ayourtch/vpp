@@ -15,6 +15,9 @@
 
 #ifndef included_clib_cpu_h
 #define included_clib_cpu_h
+#ifdef __APPLE__
+#include <vppinfra/macos/platform.h>
+#endif
 
 #include <sys/syscall.h>
 #include <vppinfra/format.h>
@@ -218,7 +221,9 @@ foreach_x86_64_flags
 #undef _
 #endif /* __x86_64__ */
 #if defined(__aarch64__)
+#if !defined(__APPLE__)
 #include <sys/auxv.h>
+#endif
 #define _(flag, bit) \
 static inline int							\
 clib_cpu_supports_ ## flag()						\

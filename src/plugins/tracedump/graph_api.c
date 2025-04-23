@@ -29,6 +29,9 @@
 
 graph_main_t graph_main;
 
+#ifdef __APPLE__
+#undef MIN
+#endif
 
 #define MIN(x,y)	(((x) < (y)) ? (x) : (y))
 

@@ -527,11 +527,12 @@ unix_config (vlib_main_t * vm, unformat_input_t * input)
     {
       openlog (vgm->name, LOG_CONS | LOG_PERROR | LOG_PID, LOG_DAEMON);
       clib_error_register_handler (unix_error_handler, um);
-
+#ifndef __APPLE__
       if (!(um->flags & UNIX_FLAG_NODAEMON) && daemon ( /* chdir to / */ 0,
 						       /* stdin/stdout/stderr -> /dev/null */
 						       0) < 0)
 	clib_error_return (0, "daemon () fails");
+#endif
     }
 
   if (pidfd >= 0)

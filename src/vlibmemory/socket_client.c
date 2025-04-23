@@ -281,8 +281,12 @@ vl_sock_api_recv_fd_msg_internal (socket_client_main_t * scm, int fds[],
 				  int n_fds, u32 wait)
 {
   char msgbuf[16];
+#ifdef __APPLE__
+  char ctl[1000];
+#else
   char ctl[CMSG_SPACE (sizeof (int) * n_fds)
 	   + CMSG_SPACE (sizeof (struct ucred))];
+#endif
   struct msghdr mh = { 0 };
   struct iovec iov[1];
   ssize_t size = 0;
@@ -345,6 +349,11 @@ vl_sock_api_recv_fd_msg_internal (socket_client_main_t * scm, int fds[],
 	      uid = cr->cmcred_uid;
 	      gid = cr->cmcred_gid;
 	      pid = cr->cmcred_pid;
+	    }
+#elif __APPLE__
+	  if (cmsg->cmsg_type == SCM_CREDS)
+	    {
+   /* FIXME */
 	    }
 #endif /* __linux__ */
 	  else if (cmsg->cmsg_type == SCM_RIGHTS)

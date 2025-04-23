@@ -35,4 +35,10 @@ add_vpp_executable(test_vppapiclient NO_INSTALL
 )
 
 add_subdirectory(vapi)
+
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "python api is not supported on Darwin - plugin disabled")
+   return()
+ endif()
+
 add_subdirectory(python)

@@ -135,7 +135,11 @@
 #define __clib_noclone		  __attribute__ ((noclone))
 #endif
 #define __clib_aligned(x) __attribute__ ((aligned(x)))
+#ifdef __APPLE__
+#define __clib_section(s) __attribute__ ((section("__DATA,xxx")))
+#else
 #define __clib_section(s) __attribute__ ((section(s)))
+#endif
 #define __clib_warn_unused_result __attribute__ ((warn_unused_result))
 #define __clib_export __attribute__ ((visibility("default")))
 #ifdef __clang__

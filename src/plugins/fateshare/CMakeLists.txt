@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "fateshare is not supported on Darwin - fateshare plugin disabled")
+   return()
+ endif()
+
+
 add_vpp_plugin(fateshare
   SOURCES
   fateshare.c

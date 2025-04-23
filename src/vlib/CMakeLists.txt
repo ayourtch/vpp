@@ -69,6 +69,10 @@ elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "FreeBSD")
 set(PLATFORM_SOURCES
   freebsd/pci.c
 )
+elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+set(PLATFORM_SOURCES
+  unix/mac.c
+)
 endif()
 
 add_vpp_library(vlib

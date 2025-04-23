@@ -250,6 +250,10 @@ elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "FreeBSD")
     elf_clib.c
     freebsd/mem.c
    )
+elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+  list(APPEND VPPINFRA_SRCS
+    macos/mem.c
+   )
 endif()
 
 add_vpp_library(vppinfra

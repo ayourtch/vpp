@@ -12,6 +12,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifdef __APPLE__
+#include <vppinfra/macos/platform.h>
+#endif
 #include <fcntl.h>
 #include <vppinfra/clib.h>
 #include <vppinfra/format.h>

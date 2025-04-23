@@ -148,6 +148,7 @@ os_get_nthreads (void)
 void
 vlib_set_thread_name (char *name)
 {
+#ifndef __APPLE__
   int pthread_setname_np (pthread_t __target_thread, const char *__name);
   int rv;
   pthread_t thread = pthread_self ();
@@ -158,6 +159,9 @@ vlib_set_thread_name (char *name)
       if (rv)
 	clib_warning ("pthread_setname_np returned %d", rv);
     }
+#else
+    clib_warning ("vlib_set_thread_name not supported on macos");
+#endif
 }
 
 static int
@@ -207,7 +211,12 @@ vlib_thread_init (vlib_main_t * vm)
 
   /* if main thread affinity is unspecified, set to current running cpu */
   if (tm->main_lcore == ~0)
+#ifdef __APPLE__
+    // FIXMEAPPLE
+    tm->main_lcore = 0;
+#else
     tm->main_lcore = sched_getcpu ();
+#endif
 
   /* grab cpu for main thread */
   if (tm->main_lcore != ~0)
@@ -225,6 +234,7 @@ vlib_thread_init (vlib_main_t * vm)
   /* pin main thread to main_lcore  */
   if (tm->main_lcore != ~0)
     {
+#ifndef __APPLE__
       cpu_set_t cpuset;
       CPU_ZERO (&cpuset);
       CPU_SET (tm->main_lcore, &cpuset);
@@ -234,6 +244,7 @@ vlib_thread_init (vlib_main_t * vm)
 	  return clib_error_return (0, "could not pin main thread to cpu %u",
 				    tm->main_lcore);
 	}
+#endif
     }
 
   /* Set up thread 0 */
@@ -246,13 +257,17 @@ vlib_thread_init (vlib_main_t * vm)
 #ifdef __FreeBSD__
   w->lwp = pthread_getthreadid_np ();
 #else
+#ifdef __APPLE__
+// FIXMEMACOS
+#else
   w->lwp = syscall (SYS_gettid);
+#endif
 #endif /* __FreeBSD__ */
   w->thread_id = pthread_self ();
   tm->n_vlib_mains = 1;
 
   vlib_get_thread_core_numa (w, w->cpu_id);
-
+#ifndef __APPLE__
   if (tm->sched_policy != ~0)
     {
       struct sched_param sched_param;
@@ -263,6 +278,7 @@ vlib_thread_init (vlib_main_t * vm)
 	  sched_setscheduler (w->lwp, tm->sched_policy, &sched_param);
 	}
     }
+#endif
 
   /* assign threads to cores and set n_vlib_mains */
   tr = tm->next;
@@ -432,7 +448,11 @@ vlib_worker_thread_bootstrap_fn (void *arg)
 #ifdef __FreeBSD__
   w->lwp = pthread_getthreadid_np ();
 #else
+#ifdef __APPLE__
+   // FIXMEMACOS
+#else
   w->lwp = syscall (SYS_gettid);
+#endif
 #endif /* __FreeBSD__ */
   w->thread_id = pthread_self ();
 
@@ -485,7 +505,9 @@ vlib_launch_thread_int (void *fp, vlib_worker_thread_t * w, unsigned cpu_id)
   vlib_thread_main_t *tm = &vlib_thread_main;
   pthread_t worker;
   pthread_attr_t attr;
+#ifndef __APPLE__
   cpu_set_t cpuset;
+#endif
   void *(*fp_arg) (void *) = fp;
   void *numa_heap;
 
@@ -512,8 +534,10 @@ vlib_launch_thread_int (void *fp, vlib_worker_thread_t * w, unsigned cpu_id)
 	}
     }
 
+#ifndef __APPLE__
       CPU_ZERO (&cpuset);
       CPU_SET (cpu_id, &cpuset);
+#endif
 
       if (pthread_attr_init (&attr))
 	return clib_error_return_unix (0, "pthread_attr_init");
@@ -524,9 +548,10 @@ vlib_launch_thread_int (void *fp, vlib_worker_thread_t * w, unsigned cpu_id)
 
       if (pthread_create (&worker, &attr, fp_arg, (void *) w))
 	return clib_error_return_unix (0, "pthread_create");
-
+#ifndef __APPLE__
       if (pthread_setaffinity_np (worker, sizeof (cpu_set_t), &cpuset))
 	return clib_error_return_unix (0, "pthread_setaffinity_np");
+#endif
 
       if (pthread_attr_destroy (&attr))
 	return clib_error_return_unix (0, "pthread_attr_destroy");

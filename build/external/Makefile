@@ -18,7 +18,7 @@ include ../packages_common.mk
 
 include packages/ipsec-mb.mk
 include packages/quicly.mk
-ifneq ($(shell uname), FreeBSD)
+ifneq ($(filter FreeBSD Darwin,$(shell uname)),)
 include packages/rdma-core.mk
 include packages/xdp-tools.mk
 include packages/octeon-roc.mk
@@ -33,14 +33,22 @@ clean:
 ifeq ($(shell uname), FreeBSD)
 install: $(if $(ARCH_X86_64), ipsec-mb-install) dpdk-install quicly-install
 else
+ifeq ($(shell uname), Darwin)
+install: quicly-install
+else
 install: $(if $(ARCH_X86_64), ipsec-mb-install) dpdk-install rdma-core-install quicly-install xdp-tools-install $(if $(AARCH64), octeon-roc-install)
+endif # Darwin
 endif	# FreeBSD
 
 .PHONY: config
 ifeq ($(shell uname), FreeBSD)
 config: $(if $(ARCH_X86_64), ipsec-mb-config) dpdk-config quicly-build
 else
+ifeq ($(shell uname), Darwin)
+config: quicly-build
+else
 config: $(if $(ARCH_X86_64), ipsec-mb-config) dpdk-config rdma-core-config quicly-build
+endif   # Darwin
 endif	# FreeBSD
 
 ##############################################################################

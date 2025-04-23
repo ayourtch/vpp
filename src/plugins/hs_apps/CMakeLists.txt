@@ -11,6 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "hs_appsis not supported on Darwin - hs_apps plugin disabled")
+   return()
+ endif()
+
+
 ##############################################################################
 # vpp builtin hs apps
 ##############################################################################

@@ -435,7 +435,9 @@ ipsec_sa_add_and_lock (u32 id, u32 spi, ipsec_protocol_t proto,
   if (p)
     return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
 
+#ifndef __APPLE__
   if (getrandom (rand, sizeof (rand), 0) != sizeof (rand))
+#endif
     return VNET_API_ERROR_INIT_FAILED;
 
   pool_get_aligned_zero (im->sa_pool, sa, CLIB_CACHE_LINE_BYTES);

@@ -168,9 +168,11 @@ notify_value (svmdb_value_t * v, svmdb_action_t a)
 	  do
 	    {
 	      rv = 0;
+#ifndef __APPLE__
 	      if (sigqueue (np->pid, np->signum, sv) == 0)
 		break;
 	      rv = errno;
+#endif
 	    }
 	  while (rv == EAGAIN);
 	  if (rv == 0)

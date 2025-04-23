@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2018 Cisco and/or its affiliates.
+ * Copyright (c) 2023 VPP Contributors
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at:
@@ -13,18 +14,23 @@
  * limitations under the License.
  */
 
-#ifndef included_vlib_config_h
-#define included_vlib_config_h
-
-#define VLIB_BUFFER_PRE_DATA_SIZE @PRE_DATA_SIZE@
-#define VLIB_BUFFER_ALIGN @VLIB_BUFFER_ALIGN@
-#define VLIB_BUFFER_ALLOC_FAULT_INJECTOR @BUFFER_ALLOC_FAULT_INJECTOR@
-#define VLIB_PROCESS_LOG2_STACK_SIZE @VLIB_PROCESS_LOG2_STACK_SIZE@
-
-/* macOS detection */
 #ifdef __APPLE__
-#define MAC_PLATFORM 1
-#define DPDK_DISABLED 1
-#endif
+#include <vlib/vlib.h>
+#include <vlib/unix/unix.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/mman.h>
+#include <sys/sysctl.h>
 
-#endif
+/* macOS specific initialization */
+static clib_error_t *
+unix_mac_init (vlib_main_t * vm)
+{
+  return 0;
+}
+
+VLIB_INIT_FUNCTION (unix_mac_init);
+#endif /* __APPLE__ */
+

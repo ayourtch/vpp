@@ -11,6 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "tlsopenssl is not supported on Darwin - plugin disabled")
+   return()
+ endif()
+
 include (CheckFunctionExists)
 if(OPENSSL_FOUND AND OPENSSL_VERSION VERSION_GREATER_EQUAL "1.1.0")
   include_directories(${OPENSSL_INCLUDE_DIR})

@@ -24,9 +24,14 @@ static u8 *
 format_sched_policy_and_priority (u8 * s, va_list * args)
 {
   long i = va_arg (*args, long);
+#ifndef __APPLE__
   struct sched_param sched_param;
+#endif
   u8 *t = 0;
-
+#ifdef __APPLE__
+    t = format(0, "FIXME%d", i);
+    return format (s, "%s (n/a)", t);
+#else
   switch (sched_getscheduler (i))
     {
 #define _(v,f,str) case SCHED_POLICY_##f: t = (u8 *) str; break;
@@ -37,6 +42,7 @@ format_sched_policy_and_priority (u8 * s, va_list * args)
     return format (s, "%s (%d)", t, sched_param.sched_priority);
   else
     return format (s, "%s (n/a)", t);
+#endif
 }
 
 static clib_error_t *

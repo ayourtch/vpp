@@ -67,6 +67,10 @@ static void rn_nodeprint(struct radix_node *, rn_printer_t, void *,
 static void rn_treeprint(struct radix_node_head *, rn_printer_t, void *);
 #endif /* RN_DEBUG */
 
+#ifdef __APPLE__
+#undef MIN
+#endif
+
 #define MIN(x,y) (((x)<(y))?(x):(y))
 
 static struct radix_mask*

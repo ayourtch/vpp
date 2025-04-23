@@ -26,6 +26,15 @@
 #include <sys/un.h>
 #define UNIX_PATH_MAX SUNPATHLEN
 #endif /* __linux__ */
+#ifdef __APPLE__
+#define UNIX_PATH_MAX 100
+#ifndef SOCK_NONBLOCK
+ #include <fcntl.h>
+ # define SOCK_NONBLOCK O_NONBLOCK
+ #endif
+
+#include <sys/un.h>
+#endif
 #include <stdbool.h>
 #include <vnet/ip/ip.h>
 

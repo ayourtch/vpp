@@ -11,6 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "tlsmbedtls is not supported on Darwin - plugin disabled")
+   return()
+ endif()
+
 vpp_find_path(MBEDTLS_INCLUDE_DIR NAMES mbedtls/ssl.h)
 
 if (NOT MBEDTLS_INCLUDE_DIR)

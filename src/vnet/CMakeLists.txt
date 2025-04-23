@@ -25,7 +25,7 @@ list(APPEND VNET_SOURCES
   buffer.c
   config.c
   devices/devices.c
-  devices/netlink.c
+  # devices/netlink.c
   dev/api.c
   dev/args.c
   dev/bus/pci.c

@@ -459,6 +459,12 @@ const char *bfd_hop_type_string (bfd_hop_type_e state);
 
 #define USEC_PER_MS (1000LL)
 #define MSEC_PER_SEC (1000LL)
+#ifdef __APPLE__
+#undef NSEC_PER_USEC
+#undef USEC_PER_SEC
+#undef NSEC_PER_SEC
+#undef SEC_PER_NSEC
+#endif
 #define NSEC_PER_USEC (1000LL)
 #define USEC_PER_SEC (MSEC_PER_SEC * USEC_PER_MS)
 #define NSEC_PER_SEC (NSEC_PER_USEC * USEC_PER_SEC)

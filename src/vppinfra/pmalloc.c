@@ -227,6 +227,7 @@ pmalloc_update_lookup_table (clib_pmalloc_main_t *pm, u32 first, u32 count)
 
   if (fd != -1)
     close (fd);
+#elif defined(__APPLE__)
 #elif defined(__FreeBSD__)
   struct mem_extract meme;
   uword p;

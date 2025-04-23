@@ -37,7 +37,7 @@ add_vpp_library(svm
   svm.h
   svmdb.h
 
-  LINK_LIBRARIES vppinfra rt pthread
+  LINK_LIBRARIES vppinfra pthread
 )
 
 ##############################################################################
@@ -45,7 +45,7 @@ add_vpp_library(svm
 ##############################################################################
 add_vpp_library(svmdb
   SOURCES svmdb.c
-  LINK_LIBRARIES svm vppinfra rt pthread
+  LINK_LIBRARIES svm vppinfra pthread
   )
 
 ##############################################################################

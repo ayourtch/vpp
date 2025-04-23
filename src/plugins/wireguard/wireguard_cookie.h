@@ -45,6 +45,9 @@ enum cookie_mac_state
 /* Constants for initiation rate limiting */
 #define RATELIMIT_SIZE		(1 << 13)
 #define RATELIMIT_SIZE_MAX	(RATELIMIT_SIZE * 8)
+#ifdef __APPLE__
+#undef NSEC_PER_SEC
+#endif
 #define NSEC_PER_SEC		1000000000LL
 #define INITIATIONS_PER_SECOND	20
 #define INITIATIONS_BURSTABLE	5

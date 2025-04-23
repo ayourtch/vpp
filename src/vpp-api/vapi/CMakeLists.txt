@@ -22,7 +22,7 @@ add_vpp_library(vapiclient
   vapi.c
   libvapiclient.map
 
-  LINK_LIBRARIES vppinfra vlibmemoryclient svm pthread m rt
+  LINK_LIBRARIES vppinfra vlibmemoryclient svm pthread m
   DEPENDS api_headers
 )
 
@@ -87,7 +87,7 @@ if(SUBUNIT_INCLUDE_DIR AND SUBUNIT_LIB)
   add_custom_target(fake_api_vapi_h DEPENDS fake.api.vapi.h)
   add_custom_target(fake_api_vapi_hpp DEPENDS fake.api.vapi.hpp)
 
-  set(libs vppinfra vlibmemoryclient svm pthread check rt m vapiclient ${SUBUNIT_LIB})
+  set(libs vppinfra vlibmemoryclient svm pthread check m vapiclient ${SUBUNIT_LIB})
 
   add_vpp_executable(vapi_c_test
     SOURCES

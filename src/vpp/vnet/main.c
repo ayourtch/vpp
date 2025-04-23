@@ -122,8 +122,10 @@ main (int argc, char *argv[])
   clib_mem_page_sz_t default_log2_hugepage_sz = CLIB_MEM_PAGE_SZ_UNKNOWN;
   unformat_input_t input, sub_input;
   u8 *s = 0, *v = 0;
+#ifndef __APPLE__
   int main_core = ~0;
   cpu_set_t cpuset;
+#endif
   void *main_heap;
 
 #if __x86_64__
@@ -270,6 +272,7 @@ main (int argc, char *argv[])
 	}
       else if (!strncmp (argv[i], "main-core", 9))
 	{
+#ifndef __APPLE__
 	  if (i < (argc - 1))
 	    {
 	      errno = 0;
@@ -277,6 +280,9 @@ main (int argc, char *argv[])
 	      if (errno == 0)
 		main_core = x;
 	    }
+#else
+clib_warning("main-core not supported on macos");
+#endif
 	}
       else if (!strncmp (argv[i], "interactive", 11))
 	unix_main.flags |= UNIX_FLAG_INTERACTIVE;
@@ -330,9 +336,13 @@ defaulted:
   unformat_free (&input);
 
   /* if main thread affinity is unspecified, set to current running cpu */
+#ifndef __APPLE__
   if (main_core == ~0)
     main_core = sched_getcpu ();
+#endif
 
+
+#ifndef __APPLE__
   /* set process affinity for main thread */
   if (main_core != ~0)
     {
@@ -346,6 +356,7 @@ defaulted:
 	    main_core);
 	}
     }
+#endif
 
   /* Set up the plugin message ID allocator right now... */
   vl_msg_api_set_first_available_msg_id (VL_MSG_MEMCLNT_LAST + 1);

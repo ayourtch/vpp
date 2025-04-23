@@ -17,6 +17,11 @@ if(NOT OPENSSL_FOUND)
   return()
 endif()
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "dev_ena is not supported on Darwin - plugin disabled")
+   return()
+ endif()
+
 unset(QUIC_LINK_LIBRARIES)
 set(EXPECTED_QUICLY_VERSION "0.1.5-vpp")
 

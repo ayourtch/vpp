@@ -17,6 +17,11 @@ if ("${CMAKE_SYSTEM_NAME}" STREQUAL "FreeBSD")
   return()
 endif()
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "sflow is not supported on Darwin - plugin disabled")
+   return()
+ endif()
+
 add_vpp_plugin(sflow
   SOURCES
   sflow.c

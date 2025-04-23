@@ -258,6 +258,10 @@ sigaction_handler (int signum, siginfo_t * i, void *notused)
   action = i->si_code;
   opaque = 0;
 #endif /* __linux__ */
+#ifdef __APPLE__
+  action = i->si_code;
+  opaque = 0;
+#endif
 
   clib_warning ("signal %d, action %d, opaque %x", signum, action, opaque);
 }

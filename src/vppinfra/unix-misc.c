@@ -396,12 +396,17 @@ os_get_exec_path ()
   if (sz <= 0)
     return 0;
 #else
+#ifdef __APPLE__
+  char tmp[1024] = "/please/fixme";
+  size_t sz = strlen(tmp);
+#else
   char tmp[MAXPATHLEN];
   int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
   size_t sz = MAXPATHLEN;
 
   if (sysctl (mib, 4, tmp, &sz, NULL, 0) == -1)
     return 0;
+#endif
 #endif
   vec_add (rv, tmp, sz);
   return rv;

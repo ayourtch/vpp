@@ -52,6 +52,7 @@ session_wrk_send_evt_to_main (session_worker_t *wrk, session_evt_elt_t *elt)
 static void
 session_wrk_timerfd_update (session_worker_t *wrk, u64 time_ns)
 {
+#ifndef __APPLE__
   struct itimerspec its;
 
   its.it_value.tv_sec = 0;
@@ -61,6 +62,9 @@ session_wrk_timerfd_update (session_worker_t *wrk, u64 time_ns)
 
   if (timerfd_settime (wrk->timerfd, 0, &its, NULL) == -1)
     clib_warning ("timerfd_settime");
+#else
+    clib_warning ("timerfd_settime APPLE");
+#endif
 }
 
 always_inline u64

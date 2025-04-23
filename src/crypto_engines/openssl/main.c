@@ -654,9 +654,12 @@ crypto_openssl_init (vnet_crypto_engine_registration_t *r)
 {
   crypto_openssl_main_t *cm = &crypto_openssl_main;
   u8 seed[32];
-
+#ifndef __APPLE__
   if (syscall (SYS_getrandom, &seed, sizeof (seed), 0) != sizeof (seed))
     return "getrandom() failed";
+#else
+  clib_warning("getrandom() not supported on OSX! FIXME!");
+#endif
 
   num_threads = r->num_threads;
 

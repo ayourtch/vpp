@@ -12,6 +12,12 @@
 #include <linux/perf_event.h>
 #endif
 
+#ifdef __APPLE__
+#define test_perf_event_disable(x)
+#define test_perf(x) 0
+#define test_perf_event_enable(x)
+#endif
+
 typedef clib_error_t *(test_fn_t) (clib_error_t *);
 
 struct test_perf_;

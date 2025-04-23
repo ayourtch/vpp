@@ -25,6 +25,22 @@
 #include <vppinfra/lock.h>
 #include <svm/queue.h>
 
+#ifdef __APPLE__
+#include <pthread.h>
+/*
+static inline int pthread_mutex_consistent(pthread_mutex_t *mutex) {
+    return pthread_mutex_init(mutex, 0);
+}
+static inline int pthread_mutexattr_setrobust(pthread_mutexattr_t *attr,
+                                       int robustness) {
+return 0;
+}
+
+#define PTHREAD_MUTEX_ROBUST 0
+*/
+
+#endif
+
 typedef struct svm_msg_q_shr_queue_
 {
   pthread_mutex_t mutex;  /* 8 bytes */

@@ -17,7 +17,9 @@
 #include <vppinfra/mem.h>
 #include <vppinfra/format.h>
 #include <vppinfra/time.h>
+#ifndef __APPLE__
 #include <sys/eventfd.h>
+#endif
 #include <poll.h>
 
 static inline svm_msg_q_ring_t *
@@ -488,10 +490,13 @@ svm_msg_q_set_eventfd (svm_msg_q_t *mq, int fd)
 int
 svm_msg_q_alloc_eventfd (svm_msg_q_t *mq)
 {
-  int fd;
+  int fd = -1;
+  return fd;
+/*
   if ((fd = eventfd (0, 0)) < 0)
     return -1;
   svm_msg_q_set_eventfd (mq, fd);
+*/
   return 0;
 }
 

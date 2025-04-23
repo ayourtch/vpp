@@ -754,7 +754,9 @@ cdecl(clib_calljmp):
 	REG_PAIR (d14, d15, 160);
 // int cdecl(clib_setjmp) (jmp_buf)
 	.global	cdecl(clib_setjmp)
+#ifndef __APPLE__
 	.type	cdecl(clib_setjmp), %function
+#endif
 cdecl(clib_setjmp):
 	mov	x16, sp
 #define REG_PAIR(REG1, REG2, OFFS)	stp REG1, REG2, [x0, OFFS]
@@ -765,10 +767,14 @@ cdecl(clib_setjmp):
 #undef REG_ONE
 	mov	x0, x1
 	ret
+#ifndef __APPLE__
 	.size	cdecl(clib_setjmp), .-cdecl(clib_setjmp)
+#endif
 // void cdecl(clib_longjmp) (jmp_buf, int) __attribute__ ((noreturn))
 	.global	cdecl(clib_longjmp)
+#ifndef __APPLE__
 	.type	cdecl(clib_longjmp), %function
+#endif
 cdecl(clib_longjmp):
 #define REG_PAIR(REG1, REG2, OFFS)	ldp REG1, REG2, [x0, OFFS]
 #define REG_ONE(REG1, OFFS)		ldr REG1, [x0, OFFS]
@@ -782,12 +788,16 @@ cdecl(clib_longjmp):
 	// cinc	w0, w1, eq
 	// use br not ret, as ret is guaranteed to mispredict
 	br	x30
+#ifndef __APPLE__
 	.size	cdecl(clib_longjmp), .-cdecl(clib_longjmp)
+#endif
 
 
 // void cdecl(clib_calljmp) (x0=function, x1=arg, x2=new_stack)
 	.global	cdecl(clib_calljmp)
+#ifndef __APPLE__
 	.type	cdecl(clib_calljmp), %function
+#endif
 cdecl(clib_calljmp):
 	// save fn ptr
 	mov     x3, x0
@@ -815,7 +825,9 @@ cdecl(clib_calljmp):
 	ldr     x30,[x4, #8]
         mov     sp, x3
 	ret
+#ifndef __APPLE__
 	.size	cdecl(clib_calljmp), .-cdecl(clib_calljmp)
+#endif
 #elif defined(__riscv)
 #define foreach_0_to_11 _(0) _(1) _(2) _(3) _(4) _(5) _(6) _(7) _(8) _(9) _(10) _(11)
 	.global cdecl(clib_setjmp)

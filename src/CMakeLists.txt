@@ -234,9 +234,11 @@ include(cmake/crypto_engines.cmake)
 ##############################################################################
 # FreeBSD - use epoll-shim
 ##############################################################################
+# pkg-config epoll-shim --cflags-only-I
+# -I/opt/homebrew/Cellar/epoll-shim/0.0.20240608/include/libepoll-shim
 set(EPOLL_LIB "")
-if("${CMAKE_SYSTEM_NAME}" STREQUAL "FreeBSD")
-  find_path(EPOLL_SHIM_INCLUDE_DIR NAMES sys/epoll.h HINTS /usr/local/include/libepoll-shim)
+if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+  find_path(EPOLL_SHIM_INCLUDE_DIR NAMES sys/epoll.h HINTS /usr/local/include/libepoll-shimi /opt/homebrew/Cellar/epoll-shim/0.0.20240608/include/libepoll-shim)
   find_library(EPOLL_SHIM_LIB NAMES epoll-shim HINTS /usr/local/lib)
 
   if(EPOLL_SHIM_INCLUDE_DIR AND EPOLL_SHIM_LIB)
@@ -260,10 +262,10 @@ if(VPP_HOST_TOOLS_ONLY)
     DESTINATION ${VPP_RUNTIME_DIR}
     COMPONENT vpp-dev
   )
-elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux|FreeBSD")
+elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux|FreeBSD|Darwin")
   find_package(OpenSSL)
   set(SUBDIRS
-    vppinfra svm vlib vlibmemory vlibapi vnet vpp vat vat2 vcl vpp-api
+    vppinfra svm vlib vlibmemory vlibapi vnet vpp vat vat2 vpp-api
     plugins crypto_engines tools/vppapigen tools/g2 tools/perftool cmake pkg
     tools/appimage
   )

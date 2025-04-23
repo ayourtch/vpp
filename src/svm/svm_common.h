@@ -26,6 +26,9 @@
 #ifdef __linux__
 #include <sys/user.h>
 #endif /* __linux__ */
+#ifdef __APPLE__
+#include <stdint.h>
+#endif /* __APPLE__ */
 #include <vppinfra/clib.h>
 #include <vppinfra/types.h>
 

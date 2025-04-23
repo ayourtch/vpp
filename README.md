@@ -1,6 +1,8 @@
 Vector Packet Processing
 ========================
 
+LDFLAGS="-undefined dynamic_lookup" make build
+
 ## Introduction
 
 The VPP platform is an extensible framework that provides out-of-the-box

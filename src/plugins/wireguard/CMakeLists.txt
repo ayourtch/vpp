@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "wireguard is not supported on Darwin - plugin disabled")
+   return()
+ endif()
+
+
 if(NOT OPENSSL_FOUND)
   message(WARNING "OpenSSL not found - wireguard plugin disabled")
   return()

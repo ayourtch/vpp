@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright(c) 2022 Cisco Systems, Inc.
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "dev_ena is not supported on Darwin - dev_ena plugin disabled")
+   return()
+ endif()
+
 add_vpp_plugin(dev_ena
   SOURCES
   aq.c

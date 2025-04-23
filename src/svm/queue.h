@@ -20,6 +20,21 @@
 #ifndef included_svm_queue_h
 #define included_svm_queue_h
 
+#ifdef __APPLE__
+#define PTHREAD_MUTEX_ROBUST 0
+#include <pthread.h>
+
+static inline int pthread_mutex_consistent(pthread_mutex_t *mutex) {
+    return pthread_mutex_init(mutex, 0);
+}
+
+static inline int pthread_mutexattr_setrobust(pthread_mutexattr_t *attr,
+                                       int robustness) {
+return 0;
+}
+
+#endif
+
 #include <pthread.h>
 
 typedef struct _svm_queue
