@@ -46,8 +46,6 @@ unix { 									\
 	interactive 							\
         runtime-dir /Users/ayourtch/xxxvpp  \
 	cli-listen //Users/ayourtch/xxxvpp/run/vpp/cli.sock					\
-	gid $(shell id -g)						\
-	$(if $(wildcard startup.vpp),"exec startup.vpp",)		\
 }									\
 $(if $(DPDK_CONFIG), "dpdk { $(DPDK_CONFIG) }",)			\
 $(if $(EXTRA_VPP_CONFIG), "$(EXTRA_VPP_CONFIG)",)			\
@@ -714,7 +712,7 @@ define run
 	@echo "WARNING: STARTUP_CONF not defined or file doesn't exist."
 	@echo "         Running with minimal startup config: $(MINIMAL_STARTUP_CONF)\n"
 	@cd $(STARTUP_DIR) && \
-	  $(SUDO) $(2) $(1)/vpp/bin/vpp $(MINIMAL_STARTUP_CONF)
+	  $(2) $(1)/vpp/bin/vpp $(MINIMAL_STARTUP_CONF)
 endef
 else
 define run
