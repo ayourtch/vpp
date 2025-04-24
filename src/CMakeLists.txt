@@ -25,6 +25,11 @@ if(NOT DEFINED CMAKE_INSTALL_LIBDIR AND EXISTS "/etc/debian_version")
   set(CMAKE_INSTALL_LIBDIR "lib/${CMAKE_LIBRARY_ARCHITECTURE}")
 endif()
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "Set linker flags on Darwin")
+   set(CMAKE_SHARED_LINKER_FLAGS "-undefined dynamic_lookup")
+endif()
+
 include(CheckCCompilerFlag)
 include(CheckIPOSupported)
 include(GNUInstallDirs)
