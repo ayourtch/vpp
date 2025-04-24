@@ -1992,13 +1992,11 @@ vlib_main (vlib_main_t * volatile vm, unformat_input_t * input)
       goto done;
     }
 
-#ifndef __APPLE__
   if ((error = map_api_segment_init (vm)))
     {
       clib_error_report (error);
       goto done;
     }
-#endif
 
   /* See unix/main.c; most likely already set up */
   if (vgm->init_functions_called == 0)

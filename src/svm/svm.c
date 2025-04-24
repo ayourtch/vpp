@@ -572,8 +572,11 @@ svm_map_region (svm_map_region_args_t * a)
   if (CLIB_DEBUG > 1)
     clib_warning ("[%d] map region %s: shm_open (%s)",
 		  getpid (), a->name, shm_name);
-
+  shm_unlink((char *) shm_name);
   svm_fd = shm_open ((char *) shm_name, O_RDWR | O_CREAT | O_EXCL, 0777);
+  if (svm_fd < 0 && errno == 0x11) {
+       svm_fd = shm_open((char *) shm_name, O_RDWR, 0666);
+  }
 
   if (svm_fd >= 0)
     {
@@ -594,16 +597,9 @@ svm_map_region (svm_map_region_args_t * a)
 	}
 #else
 #ifdef __APPLE__
-      u8 junk = 0;
-      if (lseek (svm_fd, a->size, SEEK_SET) == (off_t) - 1)
+      if (ftruncate (svm_fd, a->size) < 0)
 	{
-	  clib_warning ("seek region size");
-	  close (svm_fd);
-	  return (0);
-	}
-      if (write (svm_fd, &junk, 1) != 1)
-	{
-	  clib_warning ("set region size");
+	  clib_warning ("ftruncate region size");
 	  close (svm_fd);
 	  return (0);
 	}
