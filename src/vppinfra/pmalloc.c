@@ -32,6 +32,9 @@
 #include <vppinfra/hash.h>
 #include <vppinfra/pmalloc.h>
 #include <vppinfra/cpu.h>
+#ifdef __APPLE__
+#include <mach/mach_vm.h>
+#endif
 
 #if __SIZEOF_POINTER__ >= 8
 #define DEFAULT_RESERVED_MB 16384
@@ -228,6 +231,50 @@ pmalloc_update_lookup_table (clib_pmalloc_main_t *pm, u32 first, u32 count)
   if (fd != -1)
     close (fd);
 #elif defined(__APPLE__)
+  uword p;
+  u32 elts_per_page = 1U << (pm->def_log2_page_sz - pm->lookup_log2_page_sz);
+  vec_validate_aligned(pm->lookup_table,
+                      vec_len(pm->pages) * elts_per_page - 1,
+                      CLIB_CACHE_LINE_BYTES);
+  p = (uword) first * elts_per_page;
+  
+  if (pm->flags & CLIB_PMALLOC_F_NO_PAGEMAP)
+    {
+      // Same implementation as before
+      while (p < (uword) elts_per_page * count)
+        {
+          pm->lookup_table[p] =
+            pointer_to_uword(pm->base) + (p << pm->lookup_log2_page_sz);
+          p++;
+        }
+      return;
+    }
+  
+  // Use POSIX shared memory
+  const char *shm_name = "/my_shared_memory";
+  int fd = shm_open(shm_name, O_RDWR | O_CREAT, 0644);
+  if (fd == -1)
+    return;
+  
+  size_t required_size = elts_per_page * count * (1U << pm->lookup_log2_page_sz);
+  ftruncate(fd, required_size);
+  
+  void *shared_memory = mmap(NULL, required_size, 
+                            PROT_READ | PROT_WRITE, 
+                            MAP_SHARED, fd, 0);
+  close(fd);
+  
+  if (shared_memory == MAP_FAILED)
+    return;
+  
+  while (p < (uword) elts_per_page * count)
+    {
+      uword offset = p << pm->lookup_log2_page_sz;
+      pm->lookup_table[p] = pointer_to_uword(shared_memory) + offset;
+      p++;
+    }
+  
+  return;
 #elif defined(__FreeBSD__)
   struct mem_extract meme;
   uword p;

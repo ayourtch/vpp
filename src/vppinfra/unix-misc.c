@@ -57,6 +57,14 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef __APPLE__
+#include <mach/thread_policy.h>
+#include <mach/thread_act.h>
+#include <mach/mach_init.h>
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>		/* writev */
@@ -279,6 +287,8 @@ os_get_online_cpu_core_bitmap ()
   return clib_sysfs_read_bitmap ("/sys/devices/system/cpu/online");
 #elif defined(__FreeBSD__)
   return os_get_cpu_affinity_bitmap (0);
+#elif defined(__APPLE__)
+  return os_get_cpu_affinity_bitmap (0);
 #else
   return 0;
 #endif
@@ -326,6 +336,26 @@ os_get_cpu_affinity_bitmap (int pid)
   for (int bit = 0; bit < CPU_SETSIZE; bit++)
     clib_bitmap_set (r, bit, CPU_ISSET (bit, &mask));
 
+  return r;
+#elif defined(__APPLE__)
+#define CPU_SETSIZE 32
+uword *r = NULL;
+  
+  // Allocate and initialize bitmap
+  clib_bitmap_alloc (r, sizeof (CPU_SETSIZE));
+  clib_bitmap_zero (r);
+  
+  
+  // In macOS, the affinity is typically represented by a single tag
+  // We'll need to convert this to a bitmap representation
+  int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+  
+      // No specific affinity, mark all CPUs as available
+      for (int bit = 0; bit < num_cpus && bit < CPU_SETSIZE; bit++)
+        {
+          clib_bitmap_set (r, bit, 1);
+        }
+  
   return r;
 #else
   return NULL;

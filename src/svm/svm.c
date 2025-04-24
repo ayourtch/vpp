@@ -60,6 +60,10 @@ svm_get_root_rp (void)
 u64
 svm_get_global_region_base_va ()
 {
+#ifdef __APPLE__
+  return 0x130000000ULL;
+#endif
+
 #if __aarch64__
   /* On AArch64 VA space can have different size, from 36 to 48 bits.
      Here we are trying to detect VA bits by parsing /proc/self/maps
@@ -589,6 +593,7 @@ svm_map_region (svm_map_region_args_t * a)
 	  return (0);
 	}
 #else
+#ifdef __APPLE__
       u8 junk = 0;
       if (lseek (svm_fd, a->size, SEEK_SET) == (off_t) - 1)
 	{
@@ -602,6 +607,21 @@ svm_map_region (svm_map_region_args_t * a)
 	  close (svm_fd);
 	  return (0);
 	}
+#else
+      u8 junk = 0;
+      if (lseek (svm_fd, a->size, SEEK_SET) == (off_t) - 1)
+	{
+	  clib_warning ("seek region size");
+	  close (svm_fd);
+	  return (0);
+	}
+      if (write (svm_fd, &junk, 1) != 1)
+	{
+	  clib_warning ("set region size");
+	  close (svm_fd);
+	  return (0);
+	}
+#endif // __APPLE__
 #endif /* __FreeBSD__ */
 
       rp = mmap (uword_to_pointer (a->baseva, void *), a->size,
@@ -767,6 +787,7 @@ svm_map_region (svm_map_region_args_t * a)
   return 0;			/* NOTREACHED *///NOSONAR
 }
 
+#ifndef __APPLE__
 static void
 svm_mutex_cleanup (void)
 {
@@ -776,6 +797,7 @@ svm_mutex_cleanup (void)
       pthread_mutex_unlock (mutexes_held[i]);	//NOSONAR
     }
 }
+#endif
 
 static int
 svm_region_init_internal (svm_map_region_args_t * a)
@@ -790,7 +812,9 @@ svm_region_init_internal (svm_map_region_args_t * a)
 
   root_rp_refcount++;
 
+#ifndef __APPLE__
   atexit (svm_mutex_cleanup);
+#endif
 
   /* Randomize the shared-VM base at init time */
   if (MMAP_PAGESIZE <= (4 << 10))

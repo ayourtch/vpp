@@ -252,6 +252,7 @@ elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "FreeBSD")
    )
 elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
   list(APPEND VPPINFRA_SRCS
+    elf_clib.c
     macos/mem.c
    )
 endif()

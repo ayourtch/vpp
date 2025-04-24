@@ -312,7 +312,11 @@ unix_error_handler (void *arg, u8 * msg, int msg_len)
     }
   else
     {
+#ifdef __APPLE__
+      CLIB_UNUSED (int r) = write (2, msg, msg_len);
+#else
       syslog (LOG_ERR | LOG_DAEMON, "%.*s", msg_len, msg);
+#endif
     }
 }
 

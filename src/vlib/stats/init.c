@@ -80,7 +80,9 @@ vlib_stats_init (vlib_main_t *vm)
   memaddr = clib_mem_vm_map_shared (0, memory_size, mfd, 0, mem_name);
 
   if (memaddr == CLIB_MEM_VM_MAP_FAILED)
-    return clib_error_return (0, "stat segment mmap failure");
+//    return clib_error_return (0, "stat segment mmap failure");
+   return clib_error_return (0, "stat segment mmap failure: %U",
+                              format_clib_error, clib_mem_get_last_error ());
 
   sys_page_sz = clib_mem_get_page_size ();
 

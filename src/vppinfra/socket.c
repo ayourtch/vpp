@@ -628,9 +628,13 @@ clib_socket_init (clib_socket_t *s)
     }
 
   socket_init_funcs (s);
-
+#ifdef __APPLE__
+  if ((s->fd = socket (sa->sa_family,
+		       s->is_seqpacket ? SOCK_STREAM : SOCK_STREAM, 0)) < 0)
+#else
   if ((s->fd = socket (sa->sa_family,
 		       s->is_seqpacket ? SOCK_SEQPACKET : SOCK_STREAM, 0)) < 0)
+#endif
     {
       err =
 	clib_error_return_unix (0, "socket (fd %d, '%s')", s->fd, s->config);

@@ -537,6 +537,7 @@ vlib_register_node (vlib_main_t *vm, vlib_node_registration_t *r, char *fmt,
 					  "process stack: %U",
 					  format_vlib_node_name, vm,
 					  n->index);
+        clib_warning("stack: %p", p->stack);
 
 	if (p->stack == CLIB_MEM_VM_MAP_FAILED)
 	  clib_panic ("failed to allocate process stack (%d bytes)",
@@ -690,7 +691,9 @@ vlib_register_all_static_nodes (vlib_main_t * vm)
   r = vgm->node_registrations;
   while (r)
     {
+      clib_warning("NODE: %s", r->name);
       vlib_register_node (vm, r, "%s", r->name);
+      clib_warning("NODENEXT: %s", r->name);
       r = r->next_registration;
     }
 }

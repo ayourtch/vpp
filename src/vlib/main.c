@@ -1953,15 +1953,18 @@ vlib_main (vlib_main_t * volatile vm, unformat_input_t * input)
 
   /* Register node ifunction variants */
   vlib_register_all_node_march_variants (vm);
+  clib_warning("ATTENTIONAB");
 
   /* Register static nodes so that init functions may use them. */
   vlib_register_all_static_nodes (vm);
+  clib_warning("ATTN: static nodes registered");
 
   /* Set seed for random number generator.
      Allow user to specify seed to make random sequence deterministic. */
   if (!unformat (input, "seed %wd", &vm->random_seed))
     vm->random_seed = clib_cpu_time_now ();
   clib_random_buffer_init (&vm->random_buffer, vm->random_seed);
+  clib_warning("ATTENTIONA");
 
   /* Initialize node graph. */
   if ((error = vlib_node_main_init (vm)))
@@ -1972,6 +1975,7 @@ vlib_main (vlib_main_t * volatile vm, unformat_input_t * input)
       else
 	goto done;
     }
+  clib_warning("ATTENTION0");
 
   /* Direct call / weak reference, for vlib standalone use-cases */
   if ((error = vpe_api_init (vm)))
@@ -1980,17 +1984,21 @@ vlib_main (vlib_main_t * volatile vm, unformat_input_t * input)
       goto done;
     }
 
+  clib_warning("ATTENTION");
+
   if ((error = vlibmemory_init (vm)))
     {
       clib_error_report (error);
       goto done;
     }
 
+#ifndef __APPLE__
   if ((error = map_api_segment_init (vm)))
     {
       clib_error_report (error);
       goto done;
     }
+#endif
 
   /* See unix/main.c; most likely already set up */
   if (vgm->init_functions_called == 0)

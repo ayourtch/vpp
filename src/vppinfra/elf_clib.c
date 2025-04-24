@@ -23,6 +23,7 @@ typedef struct
   char **path;
 } path_search_t;
 
+#ifndef __APPLE__
 always_inline void
 path_search_free (path_search_t * p)
 {
@@ -100,7 +101,9 @@ path_search (char *file)
 
   return result;
 }
+#endif
 
+#ifndef __APPLE__
 static clib_error_t *
 clib_elf_parse_file (clib_elf_main_t * cem,
 		     char *file_name, void *link_address)
@@ -211,6 +214,9 @@ done:
   return error;
 }
 
+#endif
+
+#ifndef __APPLE__
 #define __USE_GNU
 #include <link.h>
 
@@ -240,7 +246,6 @@ add_section (struct dl_phdr_info *info, size_t size, void *opaque)
 	}
       addr = 0;
     }
-
   error = clib_elf_parse_file (cem, name, addr);
   if (error)
     {
@@ -256,6 +261,7 @@ add_section (struct dl_phdr_info *info, size_t size, void *opaque)
 
   return 0;
 }
+#endif
 
 static clib_elf_main_t clib_elf_main;
 
@@ -265,8 +271,9 @@ clib_elf_main_init (char *exec_path)
   clib_elf_main_t *cem = &clib_elf_main;
 
   cem->exec_path = exec_path;
-
+#ifndef __APPLE__
   dl_iterate_phdr (add_section, cem);
+#endif
 }
 
 clib_elf_section_bounds_t *

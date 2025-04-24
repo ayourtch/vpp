@@ -88,8 +88,10 @@ clib_mem_main_init (void)
   /* numa nodes */
   va = mmap (0, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
 	     -1, 0);
-  if (va == MAP_FAILED)
+  if (va == MAP_FAILED) {
+    clib_error("Can not map main memory");
     return;
+  }
 
   if (mlock (va, page_size))
     goto done;
@@ -124,6 +126,98 @@ clib_mem_vm_randomize_va (uword *requested_va,
 			  clib_mem_page_sz_t log2_page_size)
 {
   /* TODO: Not yet implemented */
+}
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+
+int mac_memfd_create(const char *name, size_t size) {
+    char shm_name[64];
+    printf("MAC FD create: %s\n", name);
+    
+    // Generate a unique name for the shared memory object
+    snprintf(shm_name, sizeof(shm_name), "/memfd-%s-%d-%ld", 
+             name ? name : "anon", getpid(), time(NULL));
+    snprintf(shm_name, sizeof(shm_name), "/mfd-%s-%ld", 
+             name ? name : "anon", time(NULL));
+    
+    // Create the shared memory object
+    int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (fd == -1) {
+        perror("shm_open");
+        return -1;
+    }
+    
+    // Immediately unlink so it's cleaned up on process exit
+    shm_unlink(shm_name);
+/*    
+    // Set the size - this is important for mmap to work correctly
+    if (ftruncate(fd, size) == -1) {
+        perror("ftruncate");
+        close(fd);
+        return -1;
+    }
+*/
+    
+    return fd;
+}
+
+int Xcreate_memory_file(char *name, size_t size) {
+    // char name[32];
+    
+    // Create a unique name
+    // snprintf(name, sizeof(name), "/memfd-%d-%ld", getpid(), time(NULL));
+    
+    // Create shared memory object
+    // int fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
+    if (fd == -1) {
+        perror("shm_open");
+        return -1;
+    }
+    
+    // Immediately unlink the name so it's anonymous
+    shm_unlink(name);
+   
+/* 
+    // Set the size
+    if (ftruncate(fd, size) == -1) {
+        perror("ftruncate");
+        close(fd);
+        return -1;
+    }
+
+*/
+    
+    return fd;
+}
+
+int create_memory_file(char *template, size_t size) {
+    // char template[] = "/tmp/memfd-XXXXXX";
+    int fd = mkstemp(template);
+    if (fd == -1) {
+        perror("mkstemp");
+        return -1;
+    }
+    
+    // Immediately unlink so the file is removed when closed
+    unlink(template);
+   
+/* 
+    // Set the size
+    if (ftruncate(fd, size) == -1) {
+        perror("ftruncate");
+        close(fd);
+        return -1;
+    }
+*/
+    
+    return fd;
 }
 
 __clib_export int
@@ -164,7 +258,7 @@ clib_mem_vm_create_fd (clib_mem_page_sz_t log2_page_size, char *fmt, ...)
     vec_set_len (s, 249);
   vec_add1 (s, 0);
 
-  fd = -1; // memfd_create ((char *) s, memfd_flags);
+  fd = mac_memfd_create ((char *)s, 1024); //  memfd_create ((char *) s, memfd_flags);
   if (fd == -1)
     {
       vec_reset_length (mm->error);
@@ -260,10 +354,11 @@ clib_mem_vm_map_internal (void *base, clib_mem_page_sz_t log2_page_sz,
   clib_mem_main_t *mm = &clib_mem_main;
   clib_mem_vm_map_hdr_t *hdr;
   uword sys_page_sz = 1ULL << mm->log2_page_sz;
-  int mmap_flags = MAP_FIXED, is_huge = 0;
+  int mmap_flags = 0 /* MAP_FIXED */, is_huge = 0;
 
   if (fd != -1)
     {
+      // clib_warning("XXXX");
       mmap_flags |= MAP_SHARED;
       log2_page_sz = clib_mem_get_fd_log2_page_size (fd);
       if (log2_page_sz > mm->log2_page_sz)
@@ -271,7 +366,7 @@ clib_mem_vm_map_internal (void *base, clib_mem_page_sz_t log2_page_sz,
     }
   else
     {
-      mmap_flags |= MAP_PRIVATE | MAP_ANONYMOUS;
+      mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
 
       if (log2_page_sz == mm->log2_page_sz)
 	log2_page_sz = CLIB_MEM_PAGE_SZ_DEFAULT;
@@ -298,19 +393,23 @@ clib_mem_vm_map_internal (void *base, clib_mem_page_sz_t log2_page_sz,
 
   base = (void *) clib_mem_vm_reserve ((uword) base, size, log2_page_sz);
 
+   // clib_warning("XXXXXXXXXXXXXX");
   if (base == (void *) ~0)
     return CLIB_MEM_VM_MAP_FAILED;
 
   base = mmap (base, size, PROT_READ | PROT_WRITE, mmap_flags, fd, offset);
+  // clib_warning("XXX");
 
   if (base == MAP_FAILED)
     return CLIB_MEM_VM_MAP_FAILED;
 
+  /// clib_warning("XXX mlock");
   if (is_huge && (mlock (base, size) != 0))
     {
       munmap (base, size);
       return CLIB_MEM_VM_MAP_FAILED;
     }
+  /// clib_warning("XXX mmap2");
 
   hdr = mmap (base - sys_page_sz, sys_page_sz, PROT_READ | PROT_WRITE,
 	      MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, -1, 0);
@@ -348,6 +447,7 @@ clib_mem_vm_map_internal (void *base, clib_mem_page_sz_t log2_page_sz,
   map_unlock ();
 
   clib_mem_unpoison (base, size);
+  // clib_warning("XXX");
   return base;
 }
 
