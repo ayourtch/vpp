@@ -11,11 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
-   message(WARNING "abf is not supported on Darwin - plugin disabled")
-   return()
- endif()
-
 include_directories (
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
