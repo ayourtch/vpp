@@ -87,7 +87,7 @@ extract (u8 * sp, u8 * ep)
  * a vlib_plugin_registration_t.
  */
 
-static clib_error_t *
+static __attribute__((unused)) clib_error_t *
 r2_to_reg (elf_main_t *em, vlib_plugin_r2_t *r2,
 	   vlib_plugin_registration_t *reg, elf_section_t *data_section)
 {
@@ -154,22 +154,106 @@ static int
 load_one_plugin (plugin_main_t * pm, plugin_info_t * pi, int from_early_init)
 {
   void *handle;
-  int reread_reg = 1;
+  int __attribute__((unused)) reread_reg = 1;
   clib_error_t *error;
-  elf_main_t em = { 0 };
-  elf_section_t *section;
-  u8 *data;
+  elf_main_t __attribute__((unused)) em = { 0 };
+  elf_section_t __attribute__((unused)) *section;
+  u8 __attribute__((unused)) *data;
   char *version_required;
   vlib_plugin_registration_t *reg;
-  vlib_plugin_r2_t *r2;
+  vlib_plugin_r2_t __attribute__((unused)) *r2;
   plugin_config_t *pc = 0;
   uword *p;
 
+/*
+  clib_warning("Attempt to load plugin %s", pi->filename);
+  if (strcmp((char *)pi->filename, "./build-root/install-vpp_debug-native/vpp/lib/vpp_plugins/pvti_plugin.dylib") != 0) {
+    return -1;
+  }
+*/
+
+#ifdef __APPLE__
+  /* On macOS/iOS, dylib files don't use ELF format, so we'll skip ELF parsing
+     and rely on dlsym to get the plugin registration data */
+  handle = dlopen((char *)pi->filename, RTLD_LAZY);
+  if (handle == 0)
+    {
+      PLUGIN_LOG_ERR("%s", dlerror());
+      PLUGIN_LOG_ERR("Failed to load plugin '%s'", pi->name);
+      return -1;
+    }
+
+  pi->handle = handle;
+  reg = dlsym(pi->handle, "vlib_plugin_registration");
+  if (!reg)
+    {
+      PLUGIN_LOG_ERR("Not a plugin: %s\n", (char *)pi->name);
+      dlclose(pi->handle);
+      pi->handle = 0;
+      return -1;
+    }
+  
+  if (pm->plugins_default_disable)
+    reg->default_disabled = 1;
+
+#else
   if (elf_read_file (&em, (char *) pi->filename))
     return -1;
 
   /* New / improved (well, not really) registration structure? */
-  error = elf_get_section_by_name (&em, ".vlib_plugin_r2", &section);
+  error = clib_error_return (0, "unknown input '%U'",
+				     format_unformat_error, input);
+	  goto done;
+	}
+
+      vec_free (v);
+      vec_free (s);
+    }
+done:
+  input = &in;
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      unformat_input_t sub_input;
+      u8 *s = 0;
+      if (unformat (input, "path %s", &s))
+	pm->plugin_path = s;
+      else if (unformat (input, "add-path %s", &s))
+	pm->plugin_path_add = s;
+      else if (unformat (input, "name-filter %s", &s))
+	pm->plugin_name_filter = s;
+      else if (unformat (input, "vat-path %s", &s))
+	pm->vat_plugin_path = s;
+      else if (unformat (input, "vat-name-filter %s", &s))
+	pm->vat_plugin_name_filter = s;
+      else if (unformat (input, "plugin default %U",
+			 unformat_vlib_cli_sub_input, &sub_input))
+	{
+	  pm->plugins_default_disable =
+	    unformat (&sub_input, "disable") ? 1 : 0;
+	  unformat_free (&sub_input);
+	}
+      else if (unformat (input, "plugin %s %U", &s,
+			 unformat_vlib_cli_sub_input, &sub_input))
+	{
+	  error = config_one_plugin (vm, (char *) s, &sub_input);
+	  unformat_free (&sub_input);
+	  if (error)
+	    goto done2;
+	}
+      else
+	{
+	  error = clib_error_return (0, "unknown input '%U'",
+				     format_unformat_error, input);
+	  {
+	    vec_free (s);
+	    goto done2;
+	  }
+	}
+    }
+
+done2:
+  unformat_free (&in);
+  return error; = elf_get_section_by_name (&em, ".vlib_plugin_r2", &section);
   if (error == 0)
     {
       elf_section_t *data_section;
@@ -253,6 +337,8 @@ load_one_plugin (plugin_main_t * pm, plugin_info_t * pi, int from_early_init)
     reg->default_disabled = 1;
 
 process_reg:
+#endif /* __APPLE__ */
+
   p = hash_get_mem (pm->config_index_by_name, pi->name);
   if (p)
     {
@@ -340,11 +426,15 @@ process_reg:
     }
   vec_free (version_required);
 
+#ifndef __APPLE__
 #if defined(RTLD_DEEPBIND)
   handle = dlopen ((char *) pi->filename,
 		   RTLD_LAZY | (reg->deep_bind ? RTLD_DEEPBIND : 0));
 #else
   handle = dlopen ((char *) pi->filename, RTLD_LAZY);
+  if (reread_reg) {
+     clib_warning("FIXME_REREAD_REG");
+  }
 #endif
 
   if (handle == 0)
@@ -358,6 +448,7 @@ process_reg:
 
   if (reread_reg)
     reg = dlsym (pi->handle, "vlib_plugin_registration");
+#endif /* !__APPLE__ */
 
   pi->reg = reg;
   pi->version = str_array_to_vec ((char *) &reg->version,
@@ -394,13 +485,23 @@ process_reg:
   else
     PLUGIN_LOG_NOTICE ("Loaded plugin: %s", pi->name);
 
+#ifndef __APPLE__
   vec_free (data);
   elf_main_free (&em);
+#endif
   return 0;
 
 error:
+#ifndef __APPLE__
   vec_free (data);
   elf_main_free (&em);
+#else
+  if (pi->handle)
+    {
+      dlclose(pi->handle);
+      pi->handle = 0;
+    }
+#endif
   return -1;
 }
 
@@ -492,7 +593,12 @@ vlib_load_new_plugins (plugin_main_t * pm, int from_early_init)
 	  /* Only accept .so */
 	  char *ext = strrchr ((const char *) filename, '.');
 	  /* unreadable */
-	  if (!ext || (strcmp (ext, ".so") != 0) ||
+#ifdef __APPLE__
+          char *plugin_extension = ".dylib";
+#else
+          char *plugin_extension = ".so";
+#endif
+	  if (!ext || (strcmp (ext, plugin_extension) != 0) ||
 	      stat ((char *) filename, &statb) < 0)
 	    {
 	    ignore:
@@ -505,6 +611,18 @@ vlib_load_new_plugins (plugin_main_t * pm, int from_early_init)
 	    goto ignore;
 
 	  plugin_name = format (0, "%s%c", entry->d_name, 0);
+#ifdef __APPLE__
+          size_t pnlen = strlen((char *)plugin_name);
+    
+    if (pnlen > 6) {  // ".dylib" is 6 characters
+        if (strcmp((char *)plugin_name + pnlen - 6, ".dylib") == 0) {
+            // Replace ".dylib" with ".so"
+            strcpy((char *)plugin_name + pnlen - 6, ".so");
+        }
+    }
+
+#endif
+
 	  /* Have we seen this plugin already? */
 	  p = hash_get_mem (pm->plugin_by_name_hash, plugin_name);
 	  if (p == 0)

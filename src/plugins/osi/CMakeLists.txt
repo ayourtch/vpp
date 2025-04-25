@@ -11,6 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+   message(WARNING "osi is not supported on Darwin  because crash - plugin disabled")
+   return()
+ endif()
+
 add_vpp_plugin(osi
 
   SOURCES
