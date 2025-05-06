@@ -39,22 +39,57 @@
 typedef struct geneve_pcapng_main_t geneve_pcapng_main_t;
 typedef struct geneve_option_def_t geneve_option_def_t;
 typedef struct geneve_capture_filter_t geneve_capture_filter_t;
+typedef struct geneve_option_filter_t geneve_option_filter_t;
 typedef struct geneve_output_t geneve_output_t;
+
+/* 
+ * Option data types for GENEVE options
+ */
+typedef enum {
+  GENEVE_OPT_TYPE_RAW = 0,     /* Raw bytes */
+  GENEVE_OPT_TYPE_IPV4,        /* IPv4 address */
+  GENEVE_OPT_TYPE_IPV6,        /* IPv6 address */
+  GENEVE_OPT_TYPE_UINT8,       /* 8-bit integer */
+  GENEVE_OPT_TYPE_UINT16,       /* 16-bit integer */
+  GENEVE_OPT_TYPE_UINT32,       /* 32-bit integer */
+  GENEVE_OPT_TYPE_STRING,       /* String */
+} geneve_opt_data_type_t;
+
+/* Enhanced option definition for user-friendly filtering */
+struct geneve_option_def_t {
+  char *option_name;                   /* Friendly name for the option */
+  u16 opt_class;                /* Class field */
+  u8 type;                      /* Type field */
+  u8 length;                    /* Length in bytes of the option data */
+  geneve_opt_data_type_t preferred_type; /* Preferred input type for this option */
+  format_function_t *format_fn; /* Optional format function for displaying option */
+};
+
 
 /* API declarations */
 static clib_error_t *geneve_pcapng_init (vlib_main_t * vm);
-void geneve_pcapng_register_option_def (const char *name, u16 class, u8 type, u8 length);
+void geneve_pcapng_register_option_def (const char *name, u16 class, u8 type, u8 length, geneve_opt_data_type_t preferred_type);
 int geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter);
 int geneve_pcapng_del_filter (u32 sw_if_index, u32 filter_id);
 int geneve_pcapng_enable_capture (u32 sw_if_index, u8 enable);
 
-/* Option definition for user-friendly filtering */
-struct geneve_option_def_t {
-  char *name;               /* Friendly name for the option */
-  u16 opt_class;            /* Class field */
-  u8 type;                  /* Type field */
-  u8 length;                /* Length in bytes of the option data */
-  format_function_t *format_fn; /* Optional format function for displaying option */
+/* Geneve option filters */
+struct geneve_option_filter_t {
+    u8 present;            /* 1 if this option filter is active */
+    
+    /* Option can be specified by name or by direct class/type */
+    union {
+      char *option_name;   /* Reference to registered option by name */
+      struct {
+        u16 opt_class;     /* Option class */
+        u8 type;           /* Option type */
+      };
+    };
+    
+    u8 match_any;          /* If 1, just match the presence of the option */
+    u8 data_len;           /* Length of data to match (can be shorter than actual option) */
+    u8 *data;              /* Data to match against option value */
+    u8 *mask;              /* Optional mask for data matching (NULL = exact match) */
 };
 
 /* Filter structure with matching criteria */
@@ -74,24 +109,7 @@ struct geneve_capture_filter_t {
   u8 vni_present;          /* 1 if VNI should be matched */
   u32 vni;                 /* VNI to match */
   
-  /* Geneve option filters */
-  struct {
-    u8 present;            /* 1 if this option filter is active */
-    
-    /* Option can be specified by name or by direct class/type */
-    union {
-      char *option_name;   /* Reference to registered option by name */
-      struct {
-        u16 opt_class;     /* Option class */
-        u8 type;           /* Option type */
-      };
-    };
-    
-    u8 match_any;          /* If 1, just match the presence of the option */
-    u8 data_len;           /* Length of data to match (can be shorter than actual option) */
-    u8 *data;              /* Data to match against option value */
-    u8 *mask;              /* Optional mask for data matching (NULL = exact match) */
-  } *option_filters;       /* Vector of option filters */
+  geneve_option_filter_t *option_filters;       /* Vector of option filters */
 };
 
 /* Output interface definition for extensibility */
@@ -693,31 +711,6 @@ VLIB_REGISTER_NODE (geneve_pcapng_node) = {
  * API and initialization
  ******************************************************************************/
 
-void
-geneve_pcapng_register_option_def (const char *name, u16 class, u8 type, u8 length)
-{
-  geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
-  geneve_option_def_t opt_def = {0};
-  u64 key;
-  u32 index;
-  
-  /* Create option definition */
-  opt_def.name = (void *)format (0, "%s%c", name, 0);
-  opt_def.opt_class = class;
-  opt_def.type = type;
-  opt_def.length = length;
-  
-  /* Add to vector */
-  index = vec_len (gpm->option_defs);
-  vec_add1 (gpm->option_defs, opt_def);
-  
-  /* Add to hash tables */
-  hash_set_mem (gpm->option_by_name, opt_def.name, index);
-  
-  key = ((u64)class << 8) | type;
-  hash_set (gpm->option_by_class_type, key, index);
-}
-
 static u32 random_seed = 42;
 
 int
@@ -788,72 +781,6 @@ geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter
   return filter_id;
 }
 
-
-
-/* 
- * CLI commands for GENEVE PCAPng plugin
- * These commands should be added to the implementation of the plugin.
- */
-
-/* CLI command function implementations */
-
-static clib_error_t *
-geneve_pcapng_register_option_command_fn (vlib_main_t * vm,
-                                         unformat_input_t * input,
-                                         vlib_cli_command_t * cmd)
-{
-  unformat_input_t _line_input, *line_input = &_line_input;
-  clib_error_t *error = NULL;
-  u8 *name = NULL;
-  u32 opt_class = 0;
-  u32 type = 0;
-  u32 length = 0;
-  
-  /* Get a line of input */
-  if (!unformat_user (input, unformat_line_input, line_input))
-    return clib_error_return (0, "expected arguments");
-    
-  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
-    {
-      if (unformat (line_input, "name %s", &name))
-        ;
-      else if (unformat (line_input, "class %d", &opt_class))
-        ;
-      else if (unformat (line_input, "type %d", &type))
-        ;
-      else if (unformat (line_input, "length %d", &length))
-        ;
-      else
-        {
-          error = clib_error_return (0, "unknown input '%U'",
-                                    format_unformat_error, line_input);
-          goto done;
-        }
-    }
-    
-  /* Validate inputs */
-  if (name == NULL)
-    {
-      error = clib_error_return (0, "option name required");
-      goto done;
-    }
-    
-  if (length == 0)
-    {
-      error = clib_error_return (0, "length must be greater than 0");
-      goto done;
-    }
-    
-  /* Register the option */
-  geneve_pcapng_register_option_def ((char *)name, opt_class, type, length);
-  vlib_cli_output (vm, "Registered GENEVE option: name=%s, class=0x%x, type=0x%x, length=%d",
-                  name, opt_class, type, length);
-  
-done:
-  unformat_free (line_input);
-  return error;
-}
-
 static clib_error_t *
 geneve_pcapng_enable_command_fn (vlib_main_t * vm,
                                 unformat_input_t * input,
@@ -908,6 +835,141 @@ done:
   return error;
 }
 
+/* Register with preferred data type */
+void
+geneve_pcapng_register_option_def (const char *name, u16 class, u8 type, u8 length,
+                                  geneve_opt_data_type_t preferred_type)
+{
+  geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
+  geneve_option_def_t opt_def = {0};
+  u64 key;
+  u32 index;
+  
+  /* Create option definition */
+  opt_def.option_name = (void *)format (0, "%s%c", name, 0);
+  opt_def.opt_class = class;
+  opt_def.type = type;
+  opt_def.length = length;
+  opt_def.preferred_type = preferred_type;
+  
+  /* Add to vector */
+  index = vec_len (gpm->option_defs);
+  vec_add1 (gpm->option_defs, opt_def);
+  
+  /* Add to hash tables */
+  hash_set_mem (gpm->option_by_name, opt_def.option_name, index);
+  
+  key = ((u64)class << 8) | type;
+  hash_set (gpm->option_by_class_type, key, index);
+}
+
+/* 
+ * Helper function to parse option data based on type
+ */
+static clib_error_t *
+parse_option_data (unformat_input_t * input, geneve_opt_data_type_t type,
+                  u8 **data, u8 data_len)
+{
+  ip4_address_t ip4;
+  ip6_address_t ip6;
+  u32 value32;
+  u16 value16;
+  u8 value8;
+  u8 *s = 0;
+  u8 *raw_data = 0;
+  u8 byte_val;
+  int i;
+  
+  switch (type)
+    {
+    case GENEVE_OPT_TYPE_IPV4:
+      if (unformat (input, "%U", unformat_ip4_address, &ip4))
+        {
+          *data = vec_new (u8, 4);
+          clib_memcpy (*data, &ip4, 4);
+          return 0;
+        }
+      return clib_error_return (0, "invalid IPv4 address format");
+      
+    case GENEVE_OPT_TYPE_IPV6:
+      if (unformat (input, "%U", unformat_ip6_address, &ip6))
+        {
+          *data = vec_new (u8, 16);
+          clib_memcpy (*data, &ip6, 16);
+          return 0;
+        }
+      return clib_error_return (0, "invalid IPv6 address format");
+      
+    case GENEVE_OPT_TYPE_UINT8:
+      if (unformat (input, "%u", &value32) && value32 <= 255)
+        {
+          value8 = (u8)value32;
+          *data = vec_new (u8, 1);
+          clib_memcpy (*data, &value8, 1);
+          return 0;
+        }
+      return clib_error_return (0, "invalid 8-bit integer format");
+      
+    case GENEVE_OPT_TYPE_UINT16:
+      if (unformat (input, "%u", &value32) && value32 <= 65535)
+        {
+          value16 = (u16)value32;
+          value16 = clib_host_to_net_u16 (value16);
+          *data = vec_new (u8, 2);
+          clib_memcpy (*data, &value16, 2);
+          return 0;
+        }
+      return clib_error_return (0, "invalid 16-bit integer format");
+      
+    case GENEVE_OPT_TYPE_UINT32:
+      if (unformat (input, "%u", &value32))
+        {
+          value32 = clib_host_to_net_u32 (value32);
+          *data = vec_new (u8, 4);
+          clib_memcpy (*data, &value32, 4);
+          return 0;
+        }
+      return clib_error_return (0, "invalid 32-bit integer format");
+      
+    case GENEVE_OPT_TYPE_STRING:
+      if (unformat (input, "%v", &s))
+        {
+          /* Limit string to data_len - 1 (for NULL terminator) */
+          if (vec_len (s) > data_len - 1)
+            vec_set_len (s, data_len - 1);
+          
+          /* Allocate data vector and copy string with NULL terminator */
+          *data = vec_new (u8, data_len);
+          clib_memset (*data, 0, data_len);
+          clib_memcpy (*data, s, vec_len (s));
+          vec_free (s);
+          return 0;
+        }
+      return clib_error_return (0, "invalid string format");
+      
+    case GENEVE_OPT_TYPE_RAW:
+      /* Format: "HH HH HH ..." where HH is a hex byte */
+      raw_data = vec_new (u8, data_len);
+      clib_memset (raw_data, 0, data_len);
+      
+      for (i = 0; i < data_len; i++)
+        {
+          if (!unformat (input, "%x", &byte_val))
+            {
+              vec_free (raw_data);
+              return clib_error_return (0, 
+                "invalid raw format, expected %d hex bytes", data_len);
+            }
+          raw_data[i] = byte_val;
+        }
+      *data = raw_data;
+      return 0;
+      
+    default:
+      return clib_error_return (0, "unsupported option data type");
+    }
+}
+
 static clib_error_t *
 geneve_pcapng_filter_command_fn (vlib_main_t * vm,
                                 unformat_input_t * input,
@@ -915,11 +977,13 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
 {
   unformat_input_t _line_input, *line_input = &_line_input;
   vnet_main_t *vnm = vnet_get_main ();
+  geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
   clib_error_t *error = NULL;
   geneve_capture_filter_t filter = {0};
   u32 sw_if_index = ~0;
   u8 is_add = 1;
   u32 filter_id = ~0;
+  char * option_name = 0;
   
   /* Get a line of input */
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -942,7 +1006,150 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
         filter.proto_present = 1;
       else if (unformat (line_input, "vni %d", &filter.vni))
         filter.vni_present = 1;
-      /* Additional option filters would be handled here */
+      else if (unformat (line_input, "option %s", &option_name))
+        {
+          /* Create option filter */
+          geneve_option_filter_t opt_filter = {0};
+          
+          uword *p;
+          
+          /* Look up the option by name */
+          p = hash_get_mem (gpm->option_by_name, option_name);
+          if (!p)
+            {
+              error = clib_error_return (0, "unknown option name: %s",
+                                        option_name);
+              goto done;
+            }
+            
+          const geneve_option_def_t *opt_def = &gpm->option_defs[p[0]];
+          opt_filter.present = 1;
+          opt_filter.option_name = vec_dup (option_name);
+          
+          /* Check if next token is "any" */
+          if (unformat (line_input, "any"))
+            {
+              opt_filter.match_any = 1;
+            }
+          else if (unformat (line_input, "value"))
+            {
+              geneve_opt_data_type_t data_type = opt_def->preferred_type;
+              
+              /* Check for explicit type specification */
+              if (unformat (line_input, "raw"))
+                data_type = GENEVE_OPT_TYPE_RAW;
+              else if (unformat (line_input, "ipv4"))
+                data_type = GENEVE_OPT_TYPE_IPV4;
+              else if (unformat (line_input, "ipv6"))
+                data_type = GENEVE_OPT_TYPE_IPV6;
+              else if (unformat (line_input, "uint8"))
+                data_type = GENEVE_OPT_TYPE_UINT8;
+              else if (unformat (line_input, "uint16"))
+                data_type = GENEVE_OPT_TYPE_UINT16;
+              else if (unformat (line_input, "uint32"))
+                data_type = GENEVE_OPT_TYPE_UINT32;
+              else if (unformat (line_input, "string"))
+                data_type = GENEVE_OPT_TYPE_STRING;
+                
+              /* Parse the option data based on type */
+              opt_filter.data_len = opt_def->length;
+              error = parse_option_data (line_input, data_type, 
+                                        &opt_filter.data, opt_filter.data_len);
+              if (error)
+                goto done;
+                
+              /* Check for mask */
+              if (unformat (line_input, "mask"))
+                {
+                  error = parse_option_data (line_input, GENEVE_OPT_TYPE_RAW,
+                                           &opt_filter.mask, opt_filter.data_len);
+                  if (error)
+                    goto done;
+                }
+            }
+          else
+            {
+              /* Default to match any if no value provided */
+              opt_filter.match_any = 1;
+            }
+            
+          /* Add the option filter to the vector */
+          vec_add1 (filter.option_filters, opt_filter);
+        }
+      else if (unformat (line_input, "option-direct class %d type %d", 
+                        &filter.option_filters->opt_class, 
+                        &filter.option_filters->type))
+        {
+          /* Direct specification of option class/type */
+          geneve_option_filter_t opt_filter = {0};
+          
+          u64 key;
+          uword *p;
+          
+          opt_filter.present = 1;
+          opt_filter.opt_class = filter.option_filters->opt_class;
+          opt_filter.type = filter.option_filters->type;
+          
+          /* Try to find registered option info */
+          key = ((u64)opt_filter.opt_class << 8) | opt_filter.type;
+          p = hash_get (gpm->option_by_class_type, key);
+          
+          if (p)
+            {
+              /* Option is registered */
+              const geneve_option_def_t *opt_def = &gpm->option_defs[p[0]];
+              
+              /* Check if next token is "any" */
+              if (unformat (line_input, "any"))
+                {
+                  opt_filter.match_any = 1;
+                }
+              else if (unformat (line_input, "value"))
+                {
+                  geneve_opt_data_type_t data_type = opt_def->preferred_type;
+                  
+                  /* Check for explicit type specification */
+                  if (unformat (line_input, "raw"))
+                    data_type = GENEVE_OPT_TYPE_RAW;
+                  else if (unformat (line_input, "ipv4"))
+                    data_type = GENEVE_OPT_TYPE_IPV4;
+                  else if (unformat (line_input, "ipv6"))
+                    data_type = GENEVE_OPT_TYPE_IPV6;
+                  else if (unformat (line_input, "uint8"))
+                    data_type = GENEVE_OPT_TYPE_UINT8;
+                  else if (unformat (line_input, "uint16"))
+                    data_type = GENEVE_OPT_TYPE_UINT16;
+                  else if (unformat (line_input, "uint32"))
+                    data_type = GENEVE_OPT_TYPE_UINT32;
+                  else if (unformat (line_input, "string"))
+                    data_type = GENEVE_OPT_TYPE_STRING;
+                    
+                  /* Parse the option data based on type */
+                  opt_filter.data_len = opt_def->length;
+                  error = parse_option_data (line_input, data_type, 
+                                            &opt_filter.data, opt_filter.data_len);
+                  if (error)
+                    goto done;
+                    
+                  /* Check for mask */
+                  if (unformat (line_input, "mask"))
+                    {
+                      error = parse_option_data (line_input, GENEVE_OPT_TYPE_RAW,
+                                              &opt_filter.mask, opt_filter.data_len);
+                      if (error)
+                        goto done;
+                    }
+                }
+              else
+                {
+                  /* Default to match any if no value provided */
+                  opt_filter.match_any = 1;
+                }
+            }
+            
+          /* Add the option filter to the vector */
+          vec_add1 (filter.option_filters, opt_filter);
+        }
       else
         {
           error = clib_error_return (0, "unknown input '%U'",
@@ -993,11 +1200,233 @@ done:
   return error;
 }
 
-/* CLI command to register a named GENEVE option */
+/* Updated CLI command for better help text */
+VLIB_CLI_COMMAND (geneve_pcapng_filter_command, static) = {
+  .path = "geneve pcapng filter",
+  .short_help = "geneve pcapng filter interface <interface> [ver <ver>] [opt-len <len>] [protocol <proto>] [vni <vni>] "
+                "[option <name> [any|value [raw|ipv4|ipv6|uint8|uint16|uint32|string] <data> [mask <mask>]]] "
+                "[option-direct class <class> type <type> [any|value [raw|ipv4|ipv6|uint8|uint16|uint32|string] <data> [mask <mask>]]] "
+                "[del id <id>]",
+  .function = geneve_pcapng_filter_command_fn,
+};
+
+/* Updated option registrations with preferred types */
+static void
+register_default_options (void)
+{
+  /* Register some basic GENEVE option definitions with preferred types */
+  geneve_pcapng_register_option_def ("vpp-metadata", 0x0123, 0x01, 8, GENEVE_OPT_TYPE_UINT32);
+  geneve_pcapng_register_option_def ("legacy-oam", 0x0F0F, 0x01, 4, GENEVE_OPT_TYPE_UINT32);
+  geneve_pcapng_register_option_def ("tenant-ip", 0x0124, 0x02, 4, GENEVE_OPT_TYPE_IPV4);
+  geneve_pcapng_register_option_def ("tenant-ipv6", 0x0124, 0x03, 16, GENEVE_OPT_TYPE_IPV6);
+  geneve_pcapng_register_option_def ("flow-id", 0x0125, 0x01, 4, GENEVE_OPT_TYPE_UINT32);
+  geneve_pcapng_register_option_def ("app-id", 0x0125, 0x02, 2, GENEVE_OPT_TYPE_UINT16);
+  geneve_pcapng_register_option_def ("service-tag", 0x0126, 0x01, 8, GENEVE_OPT_TYPE_STRING);
+}
+
+static clib_error_t *
+geneve_pcapng_register_option_command_fn (vlib_main_t * vm,
+                                         unformat_input_t * input,
+                                         vlib_cli_command_t * cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  clib_error_t *error = NULL;
+  u8 *name = NULL;
+  u32 opt_class = 0;
+  u32 type = 0;
+  u32 length = 0;
+  geneve_opt_data_type_t data_type = GENEVE_OPT_TYPE_RAW;
+
+  /* Get a line of input */
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return clib_error_return (0, "expected arguments");
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "name %s", &name))
+        ;
+      else if (unformat (line_input, "class %d", &opt_class))
+        ;
+      else if (unformat (line_input, "type %d", &type))
+        ;
+      else if (unformat (line_input, "length %d", &length))
+        ;
+      else if (unformat (line_input, "data-type raw"))
+        data_type = GENEVE_OPT_TYPE_RAW;
+      else if (unformat (line_input, "data-type ipv4"))
+        data_type = GENEVE_OPT_TYPE_IPV4;
+      else if (unformat (line_input, "data-type ipv6"))
+        data_type = GENEVE_OPT_TYPE_IPV6;
+      else if (unformat (line_input, "data-type uint8"))
+        data_type = GENEVE_OPT_TYPE_UINT8;
+      else if (unformat (line_input, "data-type uint16"))
+        data_type = GENEVE_OPT_TYPE_UINT16;
+      else if (unformat (line_input, "data-type uint32"))
+        data_type = GENEVE_OPT_TYPE_UINT32;
+      else if (unformat (line_input, "data-type string"))
+        data_type = GENEVE_OPT_TYPE_STRING;
+      else
+        {
+          error = clib_error_return (0, "unknown input '%U'",
+                                    format_unformat_error, line_input);
+          goto done;
+        }
+    }
+
+  /* Validate inputs */
+  if (name == NULL)
+    {
+      error = clib_error_return (0, "option name required");
+      goto done;
+    }
+
+  if (length == 0)
+    {
+      error = clib_error_return (0, "length must be greater than 0");
+      goto done;
+    }
+
+  /* Validate data type against length */
+  switch (data_type)
+    {
+    case GENEVE_OPT_TYPE_IPV4:
+      if (length < 4)
+        {
+          error = clib_error_return (0, "length must be at least 4 bytes for IPv4 data type");
+          goto done;
+        }
+      break;
+
+    case GENEVE_OPT_TYPE_IPV6:
+      if (length < 16)
+        {
+          error = clib_error_return (0, "length must be at least 16 bytes for IPv6 data type");
+          goto done;
+        }
+      break;
+
+    case GENEVE_OPT_TYPE_UINT8:
+      if (length < 1)
+        {
+          error = clib_error_return (0, "length must be at least 1 byte for uint8 data type");
+          goto done;
+        }
+      break;
+
+    case GENEVE_OPT_TYPE_UINT16:
+      if (length < 2)
+        {
+          error = clib_error_return (0, "length must be at least 2 bytes for uint16 data type");
+          goto done;
+        }
+      break;
+
+    case GENEVE_OPT_TYPE_UINT32:
+      if (length < 4)
+        {
+          error = clib_error_return (0, "length must be at least 4 bytes for uint32 data type");
+          goto done;
+        }
+      break;
+
+    case GENEVE_OPT_TYPE_STRING:
+      /* Strings need at least 1 byte for the null terminator */
+      if (length < 1)
+        {
+          error = clib_error_return (0, "length must be at least 1 byte for string data type");
+          goto done;
+        }
+      break;
+
+    default:
+      /* Raw type has no constraints */
+      break;
+    }
+
+  /* Register the option */
+  geneve_pcapng_register_option_def ((char *)name, opt_class, type, length, data_type);
+  vlib_cli_output (vm, "Registered GENEVE option: name=%s, class=0x%x, type=0x%x, length=%d, data-type=%s",
+                  name, opt_class, type, length,
+                  data_type == GENEVE_OPT_TYPE_RAW ? "raw" :
+                  data_type == GENEVE_OPT_TYPE_IPV4 ? "ipv4" :
+                  data_type == GENEVE_OPT_TYPE_IPV6 ? "ipv6" :
+                  data_type == GENEVE_OPT_TYPE_UINT8 ? "uint8" :
+                  data_type == GENEVE_OPT_TYPE_UINT16 ? "uint16" :
+                  data_type == GENEVE_OPT_TYPE_UINT32 ? "uint32" :
+                  data_type == GENEVE_OPT_TYPE_STRING ? "string" : "unknown");
+
+done:
+  unformat_free (line_input);
+  return error;
+}
+
+/* Helper function to format data type as string */
+static u8 *
+format_geneve_data_type (u8 * s, va_list * args)
+{
+  geneve_opt_data_type_t type = va_arg (*args, int);  /* enum is promoted to int */
+
+  switch (type)
+    {
+    case GENEVE_OPT_TYPE_RAW:
+      return format (s, "raw");
+    case GENEVE_OPT_TYPE_IPV4:
+      return format (s, "ipv4");
+    case GENEVE_OPT_TYPE_IPV6:
+      return format (s, "ipv6");
+    case GENEVE_OPT_TYPE_UINT8:
+      return format (s, "uint8");
+    case GENEVE_OPT_TYPE_UINT16:
+      return format (s, "uint16");
+    case GENEVE_OPT_TYPE_UINT32:
+      return format (s, "uint32");
+    case GENEVE_OPT_TYPE_STRING:
+      return format (s, "string");
+    default:
+      return format (s, "unknown");
+    }
+}
+
+/* Show registered GENEVE options */
+static clib_error_t *
+geneve_pcapng_show_options_command_fn (vlib_main_t * vm,
+                                      unformat_input_t * input,
+                                      vlib_cli_command_t * cmd)
+{
+  geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
+  u32 i;
+
+  vlib_cli_output (vm, "Registered GENEVE options:");
+  vlib_cli_output (vm, "%-20s %-10s %-10s %-10s %s",
+                  "Name", "Class", "Type", "Length", "Data Type");
+  vlib_cli_output (vm, "%-20s %-10s %-10s %-10s %s",
+                  "--------------------", "----------", "----------", "----------", "----------");
+
+  /* Display all registered options */
+  for (i = 0; i < vec_len (gpm->option_defs); i++)
+    {
+      geneve_option_def_t *opt = &gpm->option_defs[i];
+      vlib_cli_output (vm, "%-20s 0x%-8x %-10u %-10u %U",
+                      opt->option_name, opt->opt_class, opt->type, opt->length,
+                      format_geneve_data_type, opt->preferred_type);
+    }
+
+  return 0;
+}
+
+/* Updated CLI command to register a named GENEVE option */
 VLIB_CLI_COMMAND (geneve_pcapng_register_option_command, static) = {
   .path = "geneve pcapng register-option",
-  .short_help = "geneve pcapng register-option name <name> class <class> type <type> length <length>",
+  .short_help = "geneve pcapng register-option name <name> class <class> type <type> length <length>"
+                " [data-type raw|ipv4|ipv6|uint8|uint16|uint32|string]",
   .function = geneve_pcapng_register_option_command_fn,
+};
+
+/* CLI command to show registered options */
+VLIB_CLI_COMMAND (geneve_pcapng_show_options_command, static) = {
+  .path = "show geneve pcapng options",
+  .short_help = "show geneve pcapng options",
+  .function = geneve_pcapng_show_options_command_fn,
 };
 
 /* CLI command to enable or disable capture */
@@ -1006,14 +1435,6 @@ VLIB_CLI_COMMAND (geneve_pcapng_enable_command, static) = {
   .short_help = "geneve pcapng capture interface <interface> [disable]",
   .function = geneve_pcapng_enable_command_fn,
 };
-
-/* CLI command to add or delete filters */
-VLIB_CLI_COMMAND (geneve_pcapng_filter_command, static) = {
-  .path = "geneve pcapng filter",
-  .short_help = "geneve pcapng filter interface <interface> [ver <ver>] [opt-len <len>] [protocol <proto>] [vni <vni>] [del id <id>]",
-  .function = geneve_pcapng_filter_command_fn,
-};
-
 
 /*
  * File output initialization for GENEVE PCAPng plugin
@@ -1127,8 +1548,9 @@ geneve_pcapng_init (vlib_main_t * vm)
 #endif
 
   /* Register some basic GENEVE option definitions */
-  geneve_pcapng_register_option_def ("vpp-metadata", 0x0123, 0x01, 8);
-  geneve_pcapng_register_option_def ("legacy-oam", 0x0F0F, 0x01, 4);
+  geneve_pcapng_register_option_def ("vpp-metadata", 0x0123, 0x01, 8, GENEVE_OPT_TYPE_STRING);
+  geneve_pcapng_register_option_def ("legacy-oam", 0x0F0F, 0x01, 4, GENEVE_OPT_TYPE_UINT32);
+  register_default_options();
 
   return 0;
 }
