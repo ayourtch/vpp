@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_vpp_plugin(captun
+add_vpp_plugin(geneve_pcapng
   SOURCES
   main.c
 

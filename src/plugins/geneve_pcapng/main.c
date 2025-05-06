@@ -1796,6 +1796,6 @@ VLIB_INIT_FUNCTION (geneve_pcapng_init);
 
 VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,
-  .description = "Tunnel Packet Capture plugin",
+  .description = "Geneve Tunnel Packet Capture plugin",
 };
 
