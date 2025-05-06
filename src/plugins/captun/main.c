@@ -1414,6 +1414,242 @@ geneve_pcapng_show_options_command_fn (vlib_main_t * vm,
   return 0;
 }
 
+/* Helper function to format option data based on its type */
+static u8 *
+format_option_data (u8 * s, va_list * args)
+{
+  u8 *data = va_arg (*args, u8 *);
+  u8 data_len = va_arg (*args, int);  /* promoted to int */
+  geneve_opt_data_type_t type = va_arg (*args, int);  /* enum promoted to int */
+  
+  if (!data || data_len == 0)
+    return format (s, "(empty)");
+    
+  switch (type)
+    {
+    case GENEVE_OPT_TYPE_IPV4:
+      {
+        ip4_address_t *ip4 = (ip4_address_t *)data;
+        return format (s, "%U", format_ip4_address, ip4);
+      }
+      
+    case GENEVE_OPT_TYPE_IPV6:
+      {
+        ip6_address_t *ip6 = (ip6_address_t *)data;
+        return format (s, "%U", format_ip6_address, ip6);
+      }
+      
+    case GENEVE_OPT_TYPE_UINT8:
+      {
+        u8 val = data[0];
+        return format (s, "%u", val);
+      }
+      
+    case GENEVE_OPT_TYPE_UINT16:
+      {
+        u16 val = clib_net_to_host_u16(*(u16 *)data);
+        return format (s, "%u", val);
+      }
+      
+    case GENEVE_OPT_TYPE_UINT32:
+      {
+        u32 val = clib_net_to_host_u32(*(u32 *)data);
+        return format (s, "%u", val);
+      }
+      
+    case GENEVE_OPT_TYPE_STRING:
+      {
+        /* Ensure null-termination */
+        char *str = (char *)vec_dup (data);
+        str[data_len - 1] = '\0';
+        s = format (s, "\"%s\"", str);
+        vec_free (str);
+        return s;
+      }
+      
+    case GENEVE_OPT_TYPE_RAW:
+    default:
+      {
+        /* Display as hex bytes */
+        int i;
+        for (i = 0; i < data_len; i++)
+          {
+            s = format (s, "%02x", data[i]);
+            if (i < data_len - 1)
+              s = format (s, " ");
+          }
+        return s;
+      }
+    }
+}
+
+/* Show active GENEVE capture filters */
+static clib_error_t *
+geneve_pcapng_show_filters_command_fn (vlib_main_t * vm,
+                                      unformat_input_t * input,
+                                      vlib_cli_command_t * cmd)
+{
+  geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
+  u32 sw_if_index;
+  u32 i, j;
+  int filters_displayed = 0;
+  
+  vlib_cli_output (vm, "GENEVE Capture Filters:");
+  
+  /* Display filters for each interface */
+  for (sw_if_index = 0; sw_if_index < vec_len (gpm->per_interface); sw_if_index++)
+    {
+      if (gpm->per_interface[sw_if_index].filters == 0)
+        continue;
+        
+      if (vec_len (gpm->per_interface[sw_if_index].filters) == 0)
+        continue;
+        
+      vnet_sw_interface_t *sw = vnet_get_sw_interface (vnet_get_main(), sw_if_index);
+      if (!sw)
+        continue;
+        
+      vlib_cli_output (vm, "\nInterface: %U (idx %d) - Capture %s",
+                      format_vnet_sw_interface_name, vnet_get_main(), sw,
+                      sw_if_index,
+                      gpm->per_interface[sw_if_index].capture_enabled ? 
+                      "enabled" : "disabled");
+                      
+      /* Display each filter on this interface */
+      for (i = 0; i < vec_len (gpm->per_interface[sw_if_index].filters); i++)
+        {
+          geneve_capture_filter_t *filter = &gpm->per_interface[sw_if_index].filters[i];
+          
+          vlib_cli_output (vm, "  Filter ID: %u", filter->filter_id);
+          
+          /* Basic header filters */
+          if (filter->ver_present)
+            vlib_cli_output (vm, "    Version: %u", filter->ver);
+            
+          if (filter->opt_len_present)
+            vlib_cli_output (vm, "    Option Length: %u", filter->opt_len);
+            
+          if (filter->proto_present)
+            vlib_cli_output (vm, "    Protocol: 0x%04x", filter->protocol);
+            
+          if (filter->vni_present)
+            vlib_cli_output (vm, "    VNI: %u", filter->vni);
+            
+          /* Option filters */
+          if (filter->option_filters)
+            {
+              vlib_cli_output (vm, "    Option Filters:");
+              
+              for (j = 0; j < vec_len (filter->option_filters); j++)
+                {
+                  if (!filter->option_filters[j].present)
+                    continue;
+                    
+                  /* Determine option details */
+                  u16 opt_class;
+                  u8 opt_type;
+                  char *name = NULL;
+                  geneve_opt_data_type_t data_type = GENEVE_OPT_TYPE_RAW;
+                  
+                  if (filter->option_filters[j].option_name)
+                    {
+                      /* Look up registered option by name */
+                      uword *p = hash_get_mem (gpm->option_by_name, 
+                                             filter->option_filters[j].option_name);
+                      if (p)
+                        {
+                          geneve_option_def_t *opt_def = &gpm->option_defs[p[0]];
+                          opt_class = opt_def->opt_class;
+                          opt_type = opt_def->type;
+                          name = opt_def->option_name;
+                          data_type = opt_def->preferred_type;
+                        }
+                      else
+                        {
+                          /* This shouldn't happen if validation was done at filter creation */
+                          opt_class = 0;
+                          opt_type = 0;
+                          name = (char *)filter->option_filters[j].option_name;
+                        }
+                    }
+                  else
+                    {
+                      /* Direct class/type specification */
+                      opt_class = filter->option_filters[j].opt_class;
+                      opt_type = filter->option_filters[j].type;
+                      
+                      /* Try to find a registered name for this option */
+                      u64 key = ((u64)opt_class << 8) | opt_type;
+                      uword *p = hash_get (gpm->option_by_class_type, key);
+                      if (p)
+                        {
+                          geneve_option_def_t *opt_def = &gpm->option_defs[p[0]];
+                          name = opt_def->option_name;
+                          data_type = opt_def->preferred_type;
+                        }
+                    }
+                    
+                  /* Output option filter details */
+                  if (name)
+                    vlib_cli_output (vm, "      Option: %s (class=0x%x, type=0x%x)",
+                                    name, opt_class, opt_type);
+                  else
+                    vlib_cli_output (vm, "      Option: class=0x%x, type=0x%x",
+                                    opt_class, opt_type);
+                                    
+                  if (filter->option_filters[j].match_any)
+                    {
+                      vlib_cli_output (vm, "        Match: Any (presence only)");
+                    }
+                  else if (filter->option_filters[j].data)
+                    {
+                      /* Show data in both formatted and raw forms */
+                      vlib_cli_output (vm, "        Match Value: %U",
+                                      format_option_data,
+                                      filter->option_filters[j].data,
+                                      filter->option_filters[j].data_len,
+                                      data_type);
+                                      
+                      /* For non-raw types, also show raw bytes */
+                      if (data_type != GENEVE_OPT_TYPE_RAW)
+                        {
+                          vlib_cli_output (vm, "        Raw Bytes: %U",
+                                          format_option_data,
+                                          filter->option_filters[j].data,
+                                          filter->option_filters[j].data_len,
+                                          GENEVE_OPT_TYPE_RAW);
+                        }
+                        
+                      /* Show mask if present */
+                      if (filter->option_filters[j].mask)
+                        {
+                          vlib_cli_output (vm, "        Mask: %U",
+                                          format_option_data,
+                                          filter->option_filters[j].mask,
+                                          filter->option_filters[j].data_len,
+                                          GENEVE_OPT_TYPE_RAW);
+                        }
+                    }
+                }
+            }
+          
+          filters_displayed++;
+        }
+    }
+    
+  if (filters_displayed == 0)
+    vlib_cli_output (vm, "  No active filters");
+    
+  return 0;
+}
+
+/* CLI command to show active filters */
+VLIB_CLI_COMMAND (geneve_pcapng_show_filters_command, static) = {
+  .path = "show geneve pcapng filters",
+  .short_help = "show geneve pcapng filters",
+  .function = geneve_pcapng_show_filters_command_fn,
+};
+
 /* Updated CLI command to register a named GENEVE option */
 VLIB_CLI_COMMAND (geneve_pcapng_register_option_command, static) = {
   .path = "geneve pcapng register-option",
