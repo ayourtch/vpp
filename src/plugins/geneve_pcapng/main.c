@@ -514,8 +514,7 @@ geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
 }
 
 /* Filter and capture Geneve packets */
-static uword
-geneve_pcapng_node_fn (vlib_main_t *vm,
+VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
                        vlib_node_runtime_t *node,
                        vlib_frame_t *frame)
 {
@@ -694,18 +693,27 @@ packet_done:
 }
 
 /* Node registration */
+vlib_node_registration_t geneve_pcapng_node;
+
 VLIB_REGISTER_NODE (geneve_pcapng_node) = {
-  .function = geneve_pcapng_node_fn,
   .name = "geneve-pcapng-capture",
   .vector_size = sizeof (u32),
-  .format_trace = 0, /* No tracing */
+  .format_trace = 0,
   .type = VLIB_NODE_TYPE_INTERNAL,
   .n_errors = 0,
+  // Specify next nodes if any
   .n_next_nodes = 1,
   .next_nodes = {
     [0] = "error-drop",
   },
 };
+
+VNET_FEATURE_INIT (geneve_pcapng_feature, static) = {
+  .arc_name = "interface-output",
+  .node_name = "geneve-pcapng-capture",
+  .runs_before = VNET_FEATURES ("interface-output-arc-end"),
+};
+
 
 /******************************************************************************
  * API and initialization
