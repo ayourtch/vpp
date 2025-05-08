@@ -9,6 +9,7 @@
 #include <vnet/plugin/plugin.h>
 #include <vpp/app/version.h>
 #include <vnet/udp/udp_packet.h>
+#include <vnet/ethernet/ethernet.h> /* for ethernet_header_t */
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/ip/ip6_packet.h>
 #include <vppinfra/error.h>
@@ -177,10 +178,10 @@ file_output_init (u32 worker_index)
   memset (ctx, 0, sizeof (*ctx));
 
   /* Create a unique filename per worker */
-  snprintf (filename, sizeof (filename), "geneve_capture_worker%u.pcapng", worker_index);
+  snprintf (filename, sizeof (filename), "/tmp/geneve_capture_worker%u.pcapng", worker_index);
   ctx->filename = (void *)format (0, "%s%c", filename, 0);
   
-  ctx->file = fopen ((char *) ctx->filename, "wb");
+  ctx->file = fopen ((char *) ctx->filename, "wb+");
   if (!ctx->file)
     {
       clib_warning ("Failed to create PCAPng file: %s", ctx->filename);
@@ -188,6 +189,9 @@ file_output_init (u32 worker_index)
       clib_mem_free (ctx);
       return NULL;
     }
+  else {
+    clib_warning("File is open: %s. file handle: %p", ctx->filename, ctx->file);
+  }
   
   return ctx;
 }
@@ -200,8 +204,10 @@ file_output_cleanup (void *context)
   if (!ctx)
     return;
     
-  if (ctx->file)
+  if (ctx->file) {
+    clib_warning("closing the file");
     fclose (ctx->file);
+  }
     
   vec_free (ctx->filename);
   clib_mem_free (ctx);
@@ -219,7 +225,7 @@ file_write_pcapng_shb (void *context)
     u16 minor_version;
     u64 section_len;
     u32 block_len_copy;
-  } shb;
+  } __attribute__ ((packed)) shb;
   
   if (!ctx || !ctx->file)
     return -1;
@@ -252,7 +258,7 @@ file_write_pcapng_idb (void *context, u32 if_index, const char *if_name)
   pad_len = (4 - (name_len % 4)) % 4;
   
   /* Total length of the IDB block */
-  total_len = 20 + name_len + pad_len;
+  total_len = 20 + name_len + pad_len + 4;
   
   block = clib_mem_alloc (total_len);
   if (!block)
@@ -264,13 +270,15 @@ file_write_pcapng_idb (void *context, u32 if_index, const char *if_name)
   *(u16 *)(block + 8) = 1;  /* Link type: LINKTYPE_ETHERNET */
   *(u16 *)(block + 10) = 0; /* Reserved */
   *(u32 *)(block + 12) = 0; /* SnapLen: no limit */
+  *(u16 *)(block + 16) = 2; /* ifname */
+  *(u16 *)(block + 18) = name_len; /* ifname len */
   
   /* Copy interface name to the options section */
-  memcpy (block + 16, if_name, name_len - 1);
-  block[16 + name_len - 1] = 0;  /* Ensure null termination */
+  memcpy (block + 20, if_name, name_len - 1);
+  block[20 + name_len - 1] = 0;  /* Ensure null termination */
   
   /* Add padding bytes */
-  memset (block + 16 + name_len, 0, pad_len);
+  memset (block + 20 + name_len, 0, pad_len);
   
   /* Add block length at the end */
   *(u32 *)(block + total_len - 4) = total_len;
@@ -298,7 +306,7 @@ file_write_pcapng_epb (void *context, u32 if_index, u64 timestamp,
   pad_len = (4 - (packet_len % 4)) % 4;
   
   /* Total length of the EPB block */
-  total_len = 28 + packet_len + pad_len;
+  total_len = 28 + packet_len + pad_len + 4;
   
   block = clib_mem_alloc (total_len);
   if (!block)
@@ -540,6 +548,14 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
         
       /* Write PCAPng header */
       gpm->output.write_pcapng_shb (output_ctx);
+      static u8 *if_name = 0;
+      int i;
+      // FIXME: retrieve the real interfaces
+      for (i=0; i<5; i++) {
+        vec_reset_length (if_name);
+        if_name = format (if_name, "vpp-if-%d%c", i, 0);
+        gpm->output.write_pcapng_idb (output_ctx, i, (char *)if_name);
+      }
       
       /* Store the context */
       gpm->worker_output_ctx[worker_index] = output_ctx;
@@ -559,6 +575,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           u32 bi0, sw_if_index0, next0 = 0;
           ip4_header_t *ip4;
           ip6_header_t *ip6;
+          ethernet_header_t *ether;
           udp_header_t *udp;
           geneve_header_t *geneve;
           // bool is_ip6;
@@ -583,6 +600,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           
           b0 = vlib_get_buffer (vm, bi0);
           sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
+	  vnet_feature_next (&next0, b0);
           
           /* Skip interfaces where capture is not enabled */
           if (sw_if_index0 >= vec_len (gpm->per_interface) ||
@@ -592,7 +610,8 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
             }
           
           /* Parse either IPv4 or IPv6 header */
-          ip4 = vlib_buffer_get_current (b0);
+          ether = vlib_buffer_get_current (b0);
+          ip4 = (ip4_header_t *) (ether+1);
           if ((ip4->ip_version_and_header_length & 0xF0) == 0x40)
             {
               /* IPv4 */
@@ -651,7 +670,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
                   vec_reset_length (if_name);
                   if_name = format (if_name, "vpp-if-%d%c", sw_if_index0, 0);
                   
-                  gpm->output.write_pcapng_idb (output_ctx, sw_if_index0, (char *)if_name);
+                 // gpm->output.write_pcapng_idb (output_ctx, sw_if_index0, (char *)if_name);
                   
                   /* Allocate a temporary buffer for the entire packet */
                   u8 *packet_copy = 0;
@@ -787,6 +806,57 @@ geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter
     }
     
   return filter_id;
+}
+
+
+int
+geneve_pcapng_enable_capture (u32 sw_if_index, u8 enable)
+{
+  geneve_pcapng_main_t *gmp = &geneve_pcapng_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  // vnet_feature_config_main_t *cm;
+  // vnet_config_main_t *vcm;
+  // u8 feature_index;
+
+  /* Validate interface index */
+  vnet_hw_interface_t *hw = vnet_get_sup_hw_interface (vnm, sw_if_index);
+  if (!hw)
+    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+
+  /* Ensure we have storage for this interface */
+  vec_validate (gmp->per_interface, sw_if_index);
+
+  /* Update the enabled state */
+  gmp->per_interface[sw_if_index].capture_enabled = enable;
+
+  /* Get the feature config for interface-output feature arc */
+  // cm = &vnm->vnet_features[VNET_MAIN_THREAD /* or vnet_worker_thread_barrier_async (m) */].interface_output_feature_config;
+  // vcm = &cm->config_main;
+
+  /* Get the feature index for our capture node */
+  // feature_index = vnet_feature_get_config_index_by_node_name (vnm, "interface-output", "geneve-pcapng-capture");
+
+  if (enable)
+    {
+      /* Enable the feature on this interface */
+      vnet_feature_enable_disable ("interface-output", "geneve-pcapng-capture",
+                                   sw_if_index, 1, 0, 0);
+    }
+  else
+    {
+      /* Disable the feature on this interface */
+      vnet_feature_enable_disable ("interface-output", "geneve-pcapng-capture",
+                                   sw_if_index, 0, 0, 0);
+
+      /* Clean up any resources for this interface */
+      if (vec_len (gmp->per_interface[sw_if_index].filters) > 0)
+        {
+          /* Optionally: Clear all filters when disabling capture */
+          /* vec_free (gmp->per_interface[sw_if_index].filters); */
+        }
+    }
+
+  return 0;
 }
 
 static clib_error_t *
