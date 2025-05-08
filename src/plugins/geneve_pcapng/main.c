@@ -111,6 +111,19 @@ struct geneve_capture_filter_t {
   u32 vni;                 /* VNI to match */
   
   geneve_option_filter_t *option_filters;       /* Vector of option filters */
+
+  /* outer header 5-tuple filter with mask */
+  u8 outer_filter_present;           /* 1 if outer header filter is active */
+  u8 *outer_header_mask;             /* Vector of bytes to mask in outer header */
+  u8 *outer_header_value;            /* Vector of bytes to match (after masking) */
+  u16 outer_header_length;           /* Length of outer header to match */
+  
+  /* inner header 5-tuple filter with mask */
+  u8 inner_filter_present;           /* 1 if inner header filter is active */
+  u8 *inner_header_mask;             /* Vector of bytes to mask in inner header */
+  u8 *inner_header_value;            /* Vector of bytes to match (after masking) */
+  u16 inner_header_length;           /* Length of inner header to match */
+
 };
 
 /* Output interface definition for extensibility */
@@ -143,6 +156,9 @@ struct geneve_pcapng_main_t {
   
   /* Hash table: (class,type) -> index in option_defs */
   uword *option_by_class_type;
+
+  /* Global filters (applied to all interfaces with capture enabled) */
+  geneve_capture_filter_t *global_filters;
   
   /* Per-interface filter data */
   struct {
@@ -387,7 +403,7 @@ geneve_opt_get_length (const geneve_option_t *opt)
 
 /* Check if packet matches a Geneve filter */
 static bool
-geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
+filter_matches_packet (geneve_pcapng_main_t *gpm,
                              const geneve_header_t *hdr,
                              u32 geneve_header_len,
                              const geneve_capture_filter_t *filter)
@@ -408,6 +424,47 @@ geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
     
   if (filter->vni_present && filter->vni != geneve_get_vni (hdr))
     return false;
+
+  /* Check outer header filter if present */
+  if (filter->outer_filter_present)
+  {
+    const u8 *outer_header = (const u8 *)ether;
+    u16 i;
+
+    /* Make sure buffer has enough data */
+    if (filter->outer_header_length > vlib_buffer_length_in_chain (gpm->vlib_main, buf0))
+      return false;
+    
+    /* Perform masked comparison of outer header */
+    for (i = 0; i < filter->outer_header_length; i++)
+    {
+      if ((outer_header[i] & filter->outer_header_mask[i]) != filter->outer_header_value[i])
+        return false;
+    }
+  }
+
+  /* Check inner header filter if present */
+  if (filter->inner_filter_present)
+  {
+    /* Calculate pointer to inner header (after Geneve) */
+    const u8 *inner_header = (const u8 *)geneve + sizeof(geneve_header_t) + 
+                            geneve_get_opt_len(geneve) * 4;
+    u16 i;
+    
+    /* Make sure buffer has enough data */
+    u32 outer_header_len = (u8 *)inner_header - (u8 *)ether;
+    if (outer_header_len + filter->inner_header_length > 
+        vlib_buffer_length_in_chain (gpm->vlib_main, buf0))
+      return false;
+    
+    /* Perform masked comparison of inner header */
+    for (i = 0; i < filter->inner_header_length; i++)
+    {
+      if ((inner_header[i] & filter->inner_header_mask[i]) != filter->inner_header_value[i])
+        return false;
+    }
+  }
+  
     
   /* No option filters, match just on basic headers */
   if (vec_len (filter->option_filters) == 0)
@@ -519,6 +576,37 @@ geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
     
   /* All filters matched */
   return true;
+}
+
+static bool
+geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
+                             const geneve_header_t *hdr,
+                             u32 geneve_header_len,
+                             u32 sw_if_index)
+{
+  int i;
+  
+  /* Check interface-specific filters first (if any) */
+  if (sw_if_index < vec_len(gpm->per_interface) && 
+      gpm->per_interface[sw_if_index].filters != NULL)
+  {
+    for (i = 0; i < vec_len(gpm->per_interface[sw_if_index].filters); i++)
+    {
+      if (filter_matches_packet(gpm, hdr, geneve_header_len, 
+                              &gpm->per_interface[sw_if_index].filters[i]))
+        return true;
+    }
+  }
+  
+  /* Then check global filters */
+  for (i = 0; i < vec_len(gpm->global_filters); i++)
+  {
+    if (filter_matches_packet(gpm, hdr, geneve_header_len, 
+                             &gpm->global_filters[i]))
+      return true;
+  }
+  
+  return false;
 }
 
 /* Filter and capture Geneve packets */
@@ -1048,6 +1136,232 @@ parse_option_data (unformat_input_t * input, geneve_opt_data_type_t type,
     }
 }
 
+/* Parse a hex string into a vector of bytes */
+uword
+unformat_hex_string (unformat_input_t * input, va_list * args)
+{
+  u8 **hexstring = va_arg (*args, u8 **);
+  u8 *s = 0;
+  u8 *result = 0;
+  uword length = 0;
+  
+  if (!unformat (input, "%s", &s))
+    return 0;
+    
+  /* Convert string of format "AABB CCDD EEFF" to byte array */
+  result = parse_hex_string ((char *)s);
+  vec_free (s);
+  
+  if (!result)
+    return 0;
+    
+  length = vec_len (result);
+  *hexstring = result;
+  
+  return 1;
+}
+
+/* Parse IP address and mask for 5-tuple filter */
+uword
+unformat_ip4_address_and_mask (unformat_input_t * input, va_list * args)
+{
+  u8 **mask = va_arg (*args, u8 **);
+  u8 **value = va_arg (*args, u8 **);
+  u16 *offset = va_arg (*args, u16 *);
+  ip4_address_t ip_addr, ip_mask;
+  
+  /* Default to exact match if no mask specified */
+  if (unformat (input, "%U/%U", unformat_ip4_address, &ip_addr, 
+                             unformat_ip4_address, &ip_mask))
+    {
+      /* Got IP and mask */
+    }
+  else if (unformat (input, "%U", unformat_ip4_address, &ip_addr))
+    {
+      /* Just got IP, set mask to all ones for exact match */
+      memset (&ip_mask, 0xFF, sizeof (ip_mask));
+    }
+  else
+    return 0;
+    
+  /* 
+   * Now add the IP address and mask to the correct offset in the 
+   * filter mask and value vectors.
+   * This requires knowledge of the header structure and offsets.
+   */
+  
+  /* Ensure vectors are large enough */
+  ensure_filter_size (mask, value, IP4_OFFSET + sizeof (ip4_address_t));
+  
+  /* Add IP address to value */
+  clib_memcpy (*value + IP4_OFFSET, &ip_addr, sizeof (ip4_address_t));
+  
+  /* Add mask to mask */
+  clib_memcpy (*mask + IP4_OFFSET, &ip_mask, sizeof (ip4_address_t));
+  
+  return 1;
+}
+
+/* Helper function to ensure filter vectors are big enough */
+static void
+ensure_filter_size (u8 **mask, u8 **value, u16 required_size)
+{
+  /* Create vectors if they don't exist */
+  if (*mask == NULL)
+    *mask = vec_new (u8, required_size);
+  else if (vec_len (*mask) < required_size)
+    vec_validate (*mask, required_size - 1);
+    
+  if (*value == NULL)
+    *value = vec_new (u8, required_size);
+  else if (vec_len (*value) < required_size)
+    vec_validate (*value, required_size - 1);
+    
+  /* Initialize to zeros for any new elements */
+  memset (*mask + vec_len (*mask) - (required_size - vec_len (*mask)), 0, 
+         required_size - vec_len (*mask));
+  memset (*value + vec_len (*value) - (required_size - vec_len (*value)), 0, 
+         required_size - vec_len (*value));
+}
+
+/* Get the offset of source port based on the protocol */
+static u16
+get_src_port_offset (u8 **mask)
+{
+  /* This is a simplified example - real implementation would determine
+   * the offset based on examining the mask to identify protocol
+   */
+  if (is_ipv4_filter (*mask))
+    return IPV4_HEADER_SIZE + 0; /* Offset of src port in UDP/TCP header */
+  else if (is_ipv6_filter (*mask))
+    return IPV6_HEADER_SIZE + 0; /* Offset of src port in UDP/TCP header */
+  
+  /* Default offset for unknown protocols */
+  return 0;
+}
+
+/* Add a port value to the filter at specific offset */
+static void
+add_port_to_filter (u8 **mask, u8 **value, u16 port, u16 offset)
+{
+  u16 port_network_order = clib_host_to_net_u16 (port);
+  
+  /* Ensure vectors are large enough */
+  ensure_filter_size (mask, value, offset + sizeof (u16));
+  
+  /* Set port in value */
+  clib_memcpy (*value + offset, &port_network_order, sizeof (u16));
+  
+  /* Set mask (all bits set for exact match) */
+  memset (*mask + offset, 0xFF, sizeof (u16));
+}
+
+/* Determine if the filter appears to be for IPv4 */
+static bool
+is_ipv4_filter (u8 *mask)
+{
+  /* Look for IPv4 version (4) in high nibble of first byte */
+  if (vec_len (mask) >= 1 && (mask[0] & 0xF0) == 0x40)
+    return true;
+    
+  return false;
+}
+
+static u8 *
+format_header_filter (u8 *s, va_list *args)
+{
+  u8 *mask = va_arg (*args, u8 *);
+  u8 *value = va_arg (*args, u8 *);
+  u16 length = va_arg (*args, u16);
+  u8 is_inner = va_arg (*args, int); /* promoted to int */
+  u16 i;
+  
+  s = format (s, "  %s Header Filter (%u bytes):\n", 
+             is_inner ? "Inner" : "Outer", length);
+  
+  /* Try to interpret as 5-tuple if possible */
+  if (try_format_as_5tuple (s, mask, value, length, is_inner))
+    return s;
+    
+  /* Otherwise format as raw hex */
+  s = format (s, "    Mask:  ");
+  for (i = 0; i < length; i++)
+    {
+      s = format (s, "%02x", mask[i]);
+      if ((i + 1) % 16 == 0 && i < length - 1)
+        s = format (s, "\n           ");
+      else if ((i + 1) % 4 == 0 && i < length - 1)
+        s = format (s, " ");
+    }
+    
+  s = format (s, "\n    Value: ");
+  for (i = 0; i < length; i++)
+    {
+      s = format (s, "%02x", value[i]);
+      if ((i + 1) % 16 == 0 && i < length - 1)
+        s = format (s, "\n           ");
+      else if ((i + 1) % 4 == 0 && i < length - 1)
+        s = format (s, " ");
+    }
+    
+  return s;
+}
+
+static bool
+try_format_as_5tuple (u8 *s, u8 *mask, u8 *value, u16 length, u8 is_inner)
+{
+  /* Try to identify IP version */
+  if (length < 20)
+    return false; /* Too short for IPv4 */
+    
+  /* Check IP version in first byte */
+  if ((value[0] & 0xF0) == 0x40)
+    {
+      /* Looks like IPv4 */
+      ip4_address_t src_ip, dst_ip;
+      u16 src_port, dst_port;
+      u8 protocol;
+      
+      /* Extract fields based on IPv4 header layout */
+      protocol = value[9];
+      clib_memcpy (&src_ip, value + 12, sizeof (src_ip));
+      clib_memcpy (&dst_ip, value + 16, sizeof (dst_ip));
+      
+      /* Extract ports based on protocol */
+      if (protocol == IP_PROTOCOL_UDP || protocol == IP_PROTOCOL_TCP)
+        {
+          if (length >= 24)
+            {
+              clib_memcpy (&src_port, value + 20, sizeof (src_port));
+              clib_memcpy (&dst_port, value + 22, sizeof (dst_port));
+              
+              /* Format as 5-tuple */
+              s = format (s, "    IPv4 5-tuple: proto=%d, src=%U:%d, dst=%U:%d\n",
+                         protocol,
+                         format_ip4_address, &src_ip, clib_net_to_host_u16 (src_port),
+                         format_ip4_address, &dst_ip, clib_net_to_host_u16 (dst_port));
+              return true;
+            }
+        }
+        
+      /* Format as 3-tuple */
+      s = format (s, "    IPv4 3-tuple: proto=%d, src=%U, dst=%U\n",
+                 protocol,
+                 format_ip4_address, &src_ip,
+                 format_ip4_address, &dst_ip);
+      return true;
+    }
+  else if ((value[0] & 0xF0) == 0x60)
+    {
+      /* FIXME: Looks like IPv6 - similarly extract and format */
+      /* ... */
+    }
+    
+  return false; /* Not recognized as 5-tuple */
+}
+
+
+
 static clib_error_t *
 geneve_pcapng_filter_command_fn (vlib_main_t * vm,
                                 unformat_input_t * input,
@@ -1062,6 +1376,13 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
   u8 is_add = 1;
   u32 filter_id = ~0;
   char * option_name = 0;
+
+  /* Current filter being defined (outer or inner) */
+  u8 **current_mask = NULL;
+  u8 **current_value = NULL;
+  u16 *current_length = NULL;
+  u8 *current_present = NULL;
+  
   
   /* Get a line of input */
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -1227,6 +1548,77 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
             
           /* Add the option filter to the vector */
           vec_add1 (filter.option_filters, opt_filter);
+        }
+/* New outer header filter */
+      else if (unformat (line_input, "outer-header"))
+        {
+          /* Set current pointers to outer header filter */
+          current_mask = &filter.outer_header_mask;
+          current_value = &filter.outer_header_value;
+          current_length = &filter.outer_header_length;
+          current_present = &filter.outer_filter_present;
+          *current_present = 1;
+        }
+      /* New inner header filter */
+      else if (unformat (line_input, "inner-header"))
+        {
+          /* Set current pointers to inner header filter */
+          current_mask = &filter.inner_header_mask;
+          current_value = &filter.inner_header_value;
+          current_length = &filter.inner_header_length;
+          current_present = &filter.inner_filter_present;
+          *current_present = 1;
+        }
+      /* Process hex input for mask/value pairs */
+      else if (current_mask != NULL && unformat (line_input, "hex-mask %U", 
+                                              unformat_hex_string, current_mask))
+        {
+          *current_length = vec_len(*current_mask);
+        }
+      else if (current_value != NULL && unformat (line_input, "hex-value %U", 
+                                               unformat_hex_string, current_value))
+        {
+          /* Ensure mask and value have same length */
+          if (*current_mask && vec_len(*current_mask) != vec_len(*current_value))
+            {
+              error = clib_error_return (0, "mask and value must have same length");
+              goto done;
+            }
+          
+          *current_length = vec_len(*current_value);
+        }
+      /* User-friendly 5-tuple specification for outer header */
+      else if (current_mask != NULL && unformat (line_input, "src-ip %U", 
+                                              unformat_ip4_address_and_mask, 
+                                              current_mask, current_value, 
+                                              current_length))
+        {
+          /* FIXME: Function would parse IP and mask, update the vectorsi; FIXME: IPv6 support ? */
+        }
+      else if (current_mask != NULL && unformat (line_input, "dst-ip %U", 
+                                              unformat_ip4_address_and_mask, 
+                                              current_mask, current_value, 
+                                              current_length))
+        {
+          /* FIXME: Similar to src-ip; FIXME: IPv6 support ? */
+        }
+      else if (current_mask != NULL && unformat (line_input, "src-port %d", &src_port))
+        {
+          /* Add src port to mask/value at correct offset */
+          add_port_to_filter(current_mask, current_value, src_port, 
+                           get_src_port_offset(current_mask));
+        }
+      else if (current_mask != NULL && unformat (line_input, "dst-port %d", &dst_port))
+        {
+          /* Add dst port to mask/value at correct offset */
+          add_port_to_filter(current_mask, current_value, dst_port, 
+                           get_dst_port_offset(current_mask));
+        }
+      else if (current_mask != NULL && unformat (line_input, "proto %d", &proto))
+        {
+          /* Add protocol to mask/value at correct offset */
+          add_proto_to_filter(current_mask, current_value, proto, 
+                            get_proto_offset(current_mask));
         }
       else
         {
@@ -1573,6 +1965,23 @@ geneve_pcapng_show_filters_command_fn (vlib_main_t * vm,
   int filters_displayed = 0;
   
   vlib_cli_output (vm, "GENEVE Capture Filters:");
+
+  /* Display global filters first */
+  if (vec_len(gpm->global_filters) > 0)
+  {
+    vlib_cli_output (vm, "\nGlobal Filters (applied to all interfaces):");
+    
+    for (i = 0; i < vec_len(gpm->global_filters); i++)
+    {
+      geneve_capture_filter_t *filter = &gpm->global_filters[i];
+      
+      vlib_cli_output (vm, "  Filter ID: %u", filter->filter_id);
+      
+      /* FIXME: Display filter details as in original code below */
+      
+      filters_displayed++;
+    }
+  }
   
   /* Display filters for each interface */
   for (sw_if_index = 0; sw_if_index < vec_len (gpm->per_interface); sw_if_index++)
@@ -1599,6 +2008,25 @@ geneve_pcapng_show_filters_command_fn (vlib_main_t * vm,
           geneve_capture_filter_t *filter = &gpm->per_interface[sw_if_index].filters[i];
           
           vlib_cli_output (vm, "  Filter ID: %u", filter->filter_id);
+
+/* For each filter, also display the 5-tuple filters */
+  if (filter->outer_filter_present)
+    {
+      vlib_cli_output (vm, "%U", format_header_filter,
+                      filter->outer_header_mask,
+                      filter->outer_header_value,
+                      filter->outer_header_length,
+                      0 /* is_inner */);
+    }
+    
+  if (filter->inner_filter_present)
+    {
+      vlib_cli_output (vm, "%U", format_header_filter,
+                      filter->inner_header_mask,
+                      filter->inner_header_value,
+                      filter->inner_header_length,
+                      1 /* is_inner */);
+    }
           
           /* Basic header filters */
           if (filter->ver_present)
