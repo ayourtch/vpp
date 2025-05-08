@@ -2,7 +2,7 @@
  * geneve_pcapng.c - GENEVE packet capture plugin for VPP
  *
  * Captures GENEVE tunneled packets (IPv4/IPv6) to PCAPng files
- * with support for filtering based on GENEVE options.
+ * with support for filtering based on GENEVE options and 5-tuple.
  */
 
 #include <vnet/vnet.h>
@@ -12,6 +12,7 @@
 #include <vnet/ethernet/ethernet.h> /* for ethernet_header_t */
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/ip/ip6_packet.h>
+#include <vnet/tcp/tcp_packet.h>
 #include <vppinfra/error.h>
 #include <vppinfra/hash.h>
 #include <vppinfra/vec.h>
@@ -36,11 +37,16 @@
 #define GENEVE_OPT_LEN_SHIFT 1
 #define GENEVE_OPT_LEN_MASK 0x3E
 
+/* Filter scope */
+#define FILTER_SCOPE_INTERFACE    0
+#define FILTER_SCOPE_GLOBAL       1
+
 /* Forward declarations */
 typedef struct geneve_pcapng_main_t geneve_pcapng_main_t;
 typedef struct geneve_option_def_t geneve_option_def_t;
 typedef struct geneve_capture_filter_t geneve_capture_filter_t;
 typedef struct geneve_option_filter_t geneve_option_filter_t;
+typedef struct geneve_tuple_filter_t geneve_tuple_filter_t;
 typedef struct geneve_output_t geneve_output_t;
 
 /* 
@@ -56,6 +62,13 @@ typedef enum {
   GENEVE_OPT_TYPE_STRING,       /* String */
 } geneve_opt_data_type_t;
 
+/* 5-tuple filter structure for IP/transport layer filtering */
+struct geneve_tuple_filter_t {
+  u8 *value;              /* Byte vector with exact values to match */
+  u8 *mask;               /* Byte vector with masks for matching (1 bits are checked) */
+  u32 length;             /* Length of the vectors */
+};
+
 /* Enhanced option definition for user-friendly filtering */
 struct geneve_option_def_t {
   char *option_name;                   /* Friendly name for the option */
@@ -70,8 +83,8 @@ struct geneve_option_def_t {
 /* API declarations */
 static clib_error_t *geneve_pcapng_init (vlib_main_t * vm);
 void geneve_pcapng_register_option_def (const char *name, u16 class, u8 type, u8 length, geneve_opt_data_type_t preferred_type);
-int geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter);
-int geneve_pcapng_del_filter (u32 sw_if_index, u32 filter_id);
+int geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter, u8 is_global);
+int geneve_pcapng_del_filter (u32 sw_if_index, u32 filter_id, u8 is_global);
 int geneve_pcapng_enable_capture (u32 sw_if_index, u8 enable);
 
 /* Geneve option filters */
@@ -110,6 +123,13 @@ struct geneve_capture_filter_t {
   u8 vni_present;          /* 1 if VNI should be matched */
   u32 vni;                 /* VNI to match */
   
+  /* 5-tuple filters for outer and inner headers */
+  u8 outer_tuple_present;  /* 1 if outer 5-tuple filter is active */
+  geneve_tuple_filter_t outer_tuple;  /* Outer 5-tuple filter */
+  
+  u8 inner_tuple_present;  /* 1 if inner 5-tuple filter is active */
+  geneve_tuple_filter_t inner_tuple;  /* Inner 5-tuple filter */
+  
   geneve_option_filter_t *option_filters;       /* Vector of option filters */
 };
 
@@ -143,6 +163,9 @@ struct geneve_pcapng_main_t {
   
   /* Hash table: (class,type) -> index in option_defs */
   uword *option_by_class_type;
+  
+  /* Global filters */
+  geneve_capture_filter_t *global_filters;
   
   /* Per-interface filter data */
   struct {
@@ -385,10 +408,33 @@ geneve_opt_get_length (const geneve_option_t *opt)
   return (opt->flags_length & 0x1F) * 4;
 }
 
+/* Function to check if a packet matches a 5-tuple filter */
+static bool
+packet_matches_tuple_filter (const u8 *packet_data, u32 packet_len, 
+                            const geneve_tuple_filter_t *filter)
+{
+  u32 i;
+  
+  /* Make sure we have enough data */
+  if (packet_len < filter->length)
+    return false;
+    
+  /* Apply mask and compare values */
+  for (i = 0; i < filter->length; i++)
+    {
+      if ((packet_data[i] & filter->mask[i]) != (filter->value[i] & filter->mask[i]))
+        return false;
+    }
+    
+  return true;
+}
+
 /* Check if packet matches a Geneve filter */
 static bool
 geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
-                             const geneve_header_t *hdr,
+                             const u8 *outer_hdr, u32 outer_len,
+                             const u8 *inner_hdr, u32 inner_len,
+                             const geneve_header_t *geneve_hdr,
                              u32 geneve_header_len,
                              const geneve_capture_filter_t *filter)
 {
@@ -396,25 +442,34 @@ geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
   u32 remaining_len;
   int i;
 
-  /* Check basic header fields if specified in filter */
-  if (filter->ver_present && filter->ver != geneve_get_version (hdr))
+  /* Check basic Geneve header fields if specified in filter */
+  if (filter->ver_present && filter->ver != geneve_get_version (geneve_hdr))
     return false;
     
-  if (filter->opt_len_present && filter->opt_len != geneve_get_opt_len (hdr))
+  if (filter->opt_len_present && filter->opt_len != geneve_get_opt_len (geneve_hdr))
     return false;
     
-  if (filter->proto_present && filter->protocol != clib_net_to_host_u16 (hdr->protocol))
+  if (filter->proto_present && filter->protocol != clib_net_to_host_u16 (geneve_hdr->protocol))
     return false;
     
-  if (filter->vni_present && filter->vni != geneve_get_vni (hdr))
+  if (filter->vni_present && filter->vni != geneve_get_vni (geneve_hdr))
     return false;
     
-  /* No option filters, match just on basic headers */
+  /* Check 5-tuple filters */
+  if (filter->outer_tuple_present && 
+      !packet_matches_tuple_filter (outer_hdr, outer_len, &filter->outer_tuple))
+    return false;
+    
+  if (filter->inner_tuple_present && 
+      !packet_matches_tuple_filter (inner_hdr, inner_len, &filter->inner_tuple))
+    return false;
+  
+  /* No option filters, match just on basic headers and tuples */
   if (vec_len (filter->option_filters) == 0)
     return true;
 
   /* Start of options */
-  opt = (const geneve_option_t *)(hdr + 1);
+  opt = (const geneve_option_t *)(geneve_hdr + 1);
   remaining_len = geneve_header_len - sizeof (geneve_header_t);
   
   /* Check each option filter */
@@ -521,6 +576,46 @@ geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
   return true;
 }
 
+/* Check if the packet matches any global filter */
+static bool
+matches_global_filters (geneve_pcapng_main_t *gpm,
+                       const u8 *outer_hdr, u32 outer_len,
+                       const u8 *inner_hdr, u32 inner_len,
+                       const geneve_header_t *geneve_hdr,
+                       u32 geneve_header_len)
+{
+  int i;
+  
+  /* Check each global filter */
+  for (i = 0; i < vec_len (gpm->global_filters); i++)
+    {
+      if (geneve_packet_matches_filter (gpm, 
+                                      outer_hdr, outer_len,
+                                      inner_hdr, inner_len,
+                                      geneve_hdr, geneve_header_len,
+                                      &gpm->global_filters[i]))
+        return true;
+    }
+    
+  return false;
+}
+
+/* Extract inner IP header from packet */
+static u8 *
+get_inner_ip_header (const geneve_header_t *geneve_hdr, u32 geneve_header_len,
+                    u32 *inner_len)
+{
+  u8 *inner_hdr;
+  
+  /* Calculate inner header pointer */
+  inner_hdr = (u8 *)(geneve_hdr) + geneve_header_len;
+  
+  /* Determine inner header length (simplified) */
+  *inner_len = 60;  /* Conservative estimate */
+  
+  return inner_hdr;
+}
+
 /* Filter and capture Geneve packets */
 VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
                        vlib_node_runtime_t *node,
@@ -578,8 +673,8 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           ethernet_header_t *ether;
           udp_header_t *udp;
           geneve_header_t *geneve;
-          // bool is_ip6;
-          // bool packet_captured = false;
+          bool is_ip6;
+          bool packet_captured = false;
           
           /* Prefetch next packet */
           if (n_left_from > 1)
@@ -602,9 +697,11 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
 	  vnet_feature_next (&next0, b0);
           
-          /* Skip interfaces where capture is not enabled */
-          if (sw_if_index0 >= vec_len (gpm->per_interface) ||
-              !gpm->per_interface[sw_if_index0].capture_enabled)
+          /* Skip interfaces where capture is not enabled, 
+             unless global filters are defined */
+          if ((sw_if_index0 >= vec_len (gpm->per_interface) ||
+              !gpm->per_interface[sw_if_index0].capture_enabled) &&
+              vec_len (gpm->global_filters) == 0)
             {
               goto packet_done;
             }
@@ -612,23 +709,30 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           /* Parse either IPv4 or IPv6 header */
           ether = vlib_buffer_get_current (b0);
           ip4 = (ip4_header_t *) (ether+1);
+          
+          const u8 *outer_header = (const u8 *)ip4;
+          u32 outer_header_len = sizeof(ip4_header_t);
+          
           if ((ip4->ip_version_and_header_length & 0xF0) == 0x40)
             {
-              /* IPv4 */
-              // is_ip6 = false;
+/* IPv4 */
+              is_ip6 = false;
+              outer_header_len = (ip4->ip_version_and_header_length & 0x0F) * 4;
               
               /* Skip non-UDP packets */
               if (ip4->protocol != IP_PROTOCOL_UDP)
                 goto packet_done;
                 
               /* UDP header follows IPv4 header */
-              udp = (udp_header_t *)(ip4 + 1);
+              udp = (udp_header_t *)((u8 *)ip4 + outer_header_len);
             }
           else if ((ip4->ip_version_and_header_length & 0xF0) == 0x60)
             {
               /* IPv6 */
-              // is_ip6 = true;
+              is_ip6 = true;
               ip6 = (ip6_header_t *)ip4;
+              outer_header = (const u8 *)ip6;
+              outer_header_len = sizeof(ip6_header_t);
               
               /* Skip non-UDP packets */
               if (ip6->protocol != IP_PROTOCOL_UDP)
@@ -654,50 +758,75 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           u32 geneve_opt_len = geneve_get_opt_len (geneve) * 4;
           u32 geneve_header_len = sizeof (geneve_header_t) + geneve_opt_len;
           
-          /* Check if the packet matches any filter */
-          for (i = 0; i < vec_len (gpm->per_interface[sw_if_index0].filters); i++)
+          /* Get inner header for inner 5-tuple filtering */
+          u32 inner_header_len = 0;
+          const u8 *inner_header = get_inner_ip_header(geneve, geneve_header_len, &inner_header_len);
+          
+          /* Check if packet matches any global filter */
+          if (vec_len (gpm->global_filters) > 0 &&
+              matches_global_filters (gpm, outer_header, outer_header_len,
+                                    inner_header, inner_header_len,
+                                    geneve, geneve_header_len))
             {
-              if (geneve_packet_matches_filter (gpm, geneve, geneve_header_len,
-                                              &gpm->per_interface[sw_if_index0].filters[i]))
+              /* Packet matches a global filter, capture it */
+              packet_captured = true;
+            }
+          
+          /* Check if the packet matches any per-interface filter */
+          if (!packet_captured && 
+              sw_if_index0 < vec_len (gpm->per_interface) && 
+              gpm->per_interface[sw_if_index0].capture_enabled)
+            {
+              for (i = 0; i < vec_len (gpm->per_interface[sw_if_index0].filters); i++)
                 {
-                  /* Packet matches, capture it */
-                  u64 timestamp = vlib_time_now (vm) * 1000000000; /* ns */
-                  u32 orig_len = vlib_buffer_length_in_chain (vm, b0);
-                  vlib_buffer_t *buf_iter = b0;
-                  
-                  /* Add interface description to PCAPng file if needed */
-                  static u8 *if_name = 0;
-                  vec_reset_length (if_name);
-                  if_name = format (if_name, "vpp-if-%d%c", sw_if_index0, 0);
-                  
-                 // gpm->output.write_pcapng_idb (output_ctx, sw_if_index0, (char *)if_name);
-                  
-                  /* Allocate a temporary buffer for the entire packet */
-                  u8 *packet_copy = 0;
-                  vec_validate (packet_copy, orig_len - 1);
-                  
-                  /* Copy packet data from buffer chain */
-                  u32 offset = 0;
-                  while (buf_iter)
+                  if (geneve_packet_matches_filter (gpm, 
+                                                 outer_header, outer_header_len,
+                                                 inner_header, inner_header_len,
+                                                 geneve, geneve_header_len,
+                                                 &gpm->per_interface[sw_if_index0].filters[i]))
                     {
-                      u32 len = buf_iter->current_length;
-                      clib_memcpy_fast (packet_copy + offset, 
-                                         vlib_buffer_get_current (buf_iter),
-                                         len);
-                      offset += len;
-                      buf_iter = buf_iter->flags & VLIB_BUFFER_NEXT_PRESENT ?
-                                vlib_get_buffer (vm, buf_iter->next_buffer) : 0;
+                      /* Packet matches, capture it */
+                      packet_captured = true;
+                      break;
                     }
-                  
-                  /* Write packet data to PCAPng file */
-                  gpm->output.write_pcapng_epb (output_ctx, sw_if_index0, 
-                                               timestamp, orig_len, 
-                                               packet_copy, offset);
-                                               
-                  vec_free (packet_copy);
-                  // packet_captured = true;
-                  break;
                 }
+            }
+            
+          if (packet_captured)
+            {
+              /* Capture the matching packet */
+              u64 timestamp = vlib_time_now (vm) * 1000000000; /* ns */
+              u32 orig_len = vlib_buffer_length_in_chain (vm, b0);
+              vlib_buffer_t *buf_iter = b0;
+              
+              /* Add interface description to PCAPng file if needed */
+              static u8 *if_name = 0;
+              vec_reset_length (if_name);
+              if_name = format (if_name, "vpp-if-%d%c", sw_if_index0, 0);
+              
+              /* Allocate a temporary buffer for the entire packet */
+              u8 *packet_copy = 0;
+              vec_validate (packet_copy, orig_len - 1);
+              
+              /* Copy packet data from buffer chain */
+              u32 offset = 0;
+              while (buf_iter)
+                {
+                  u32 len = buf_iter->current_length;
+                  clib_memcpy_fast (packet_copy + offset, 
+                                   vlib_buffer_get_current (buf_iter),
+                                   len);
+                  offset += len;
+                  buf_iter = buf_iter->flags & VLIB_BUFFER_NEXT_PRESENT ?
+                           vlib_get_buffer (vm, buf_iter->next_buffer) : 0;
+                }
+              
+              /* Write packet data to PCAPng file */
+              gpm->output.write_pcapng_epb (output_ctx, sw_if_index0, 
+                                         timestamp, orig_len, 
+                                         packet_copy, offset);
+                                         
+              vec_free (packet_copy);
             }
           
 packet_done:
@@ -735,30 +864,319 @@ VNET_FEATURE_INIT (geneve_pcapng_feature, static) = {
 
 
 /******************************************************************************
+ * 5-tuple filter utilities
+ ******************************************************************************/
+
+/* Helper functions to parse and format 5-tuple filter data */
+
+/* Convert network prefix to mask */
+static u8 *
+prefix_to_mask(u8 is_ipv6, u8 prefix_len)
+{
+  u8 *mask;
+  int i, bytes;
+  
+  bytes = is_ipv6 ? 16 : 4;
+  mask = vec_new(u8, bytes);
+  
+  for (i = 0; i < bytes; i++) {
+    if (prefix_len >= 8) {
+      mask[i] = 0xFF;
+      prefix_len -= 8;
+    } else if (prefix_len > 0) {
+      mask[i] = (0xFF << (8 - prefix_len));
+      prefix_len = 0;
+    } else {
+      mask[i] = 0;
+    }
+  }
+  
+  return mask;
+}
+
+/* Parse IPv4 address with optional prefix */
+static clib_error_t *
+parse_ipv4_prefix(unformat_input_t *input, u8 **value, u8 **mask)
+{
+  ip4_address_t ip4;
+  u8 prefix_len = 32;
+  
+  if (unformat(input, "%U/%d", unformat_ip4_address, &ip4, &prefix_len)) {
+    /* Address with prefix */
+    if (prefix_len > 32)
+      return clib_error_return(0, "IPv4 prefix length must be <= 32");
+  } else if (unformat(input, "%U", unformat_ip4_address, &ip4)) {
+    /* Just the address */
+  } else {
+    return clib_error_return(0, "Invalid IPv4 address format");
+  }
+  
+  /* Allocate and set value */
+  *value = vec_new(u8, 4);
+  memcpy(*value, &ip4, 4);
+  
+  /* Create mask based on prefix length */
+  *mask = prefix_to_mask(0, prefix_len);
+  
+  return 0;
+}
+
+/* Parse IPv6 address with optional prefix */
+static clib_error_t *
+parse_ipv6_prefix(unformat_input_t *input, u8 **value, u8 **mask)
+{
+  ip6_address_t ip6;
+  u8 prefix_len = 128;
+  
+  if (unformat(input, "%U/%d", unformat_ip6_address, &ip6, &prefix_len)) {
+    /* Address with prefix */
+    if (prefix_len > 128)
+      return clib_error_return(0, "IPv6 prefix length must be <= 128");
+  } else if (unformat(input, "%U", unformat_ip6_address, &ip6)) {
+    /* Just the address */
+  } else {
+    return clib_error_return(0, "Invalid IPv6 address format");
+  }
+  
+  /* Allocate and set value */
+  *value = vec_new(u8, 16);
+  memcpy(*value, &ip6, 16);
+  
+  /* Create mask based on prefix length */
+  *mask = prefix_to_mask(1, prefix_len);
+  
+  return 0;
+}
+
+/* Parse port number or range */
+static clib_error_t *
+parse_port(unformat_input_t *input, u8 **value, u8 **mask, u8 offset)
+{
+  u16 port_lo, port_hi;
+  
+  if (unformat(input, "%d-%d", &port_lo, &port_hi)) {
+    /* Port range */
+    if (port_lo > port_hi)
+      return clib_error_return(0, "Invalid port range (first > last)");
+      
+    /* For port ranges, we need to generate multiple mask/value combinations
+     * For now, we just match any port in the range by setting mask to 0
+     */
+    if (!*value) {
+      *value = vec_new(u8, 2);
+      *mask = vec_new(u8, 2);
+    }
+    
+    /* Store port in network byte order */
+    port_lo = clib_host_to_net_u16(port_lo);
+    memcpy(*value + offset, &port_lo, 2);
+    
+    /* Mask will be 0 for port range */
+    memset(*mask + offset, 0, 2);
+    
+  } else if (unformat(input, "%d", &port_lo)) {
+    /* Single port */
+    if (!*value) {
+      *value = vec_new(u8, 2);
+      *mask = vec_new(u8, 2);
+    }
+    
+    /* Store port in network byte order */
+    port_lo = clib_host_to_net_u16(port_lo);
+    memcpy(*value + offset, &port_lo, 2);
+    
+    /* Mask is all 1's for exact match */
+    memset(*mask + offset, 0xFF, 2);
+    
+  } else {
+    return clib_error_return(0, "Invalid port format");
+  }
+  
+  return 0;
+}
+
+/* Parse protocol number */
+static clib_error_t *
+parse_protocol(unformat_input_t *input, u8 **value, u8 **mask, u8 offset)
+{
+  u8 proto;
+  
+  if (unformat(input, "tcp")) {
+    proto = IP_PROTOCOL_TCP;
+  } else if (unformat(input, "udp")) {
+    proto = IP_PROTOCOL_UDP;
+  } else if (unformat(input, "icmp")) {
+    proto = IP_PROTOCOL_ICMP;
+  } else if (unformat(input, "icmp6")) {
+    proto = IP_PROTOCOL_ICMP6;
+  } else if (unformat(input, "%d", &proto)) {
+    /* Direct protocol number */
+  } else {
+    return clib_error_return(0, "Invalid protocol format");
+  }
+  
+  if (!*value) {
+    *value = vec_new(u8, 1);
+    *mask = vec_new(u8, 1);
+  }
+  
+  (*value)[offset] = proto;
+  (*mask)[offset] = 0xFF;  /* Exact match for protocol */
+  
+  return 0;
+}
+
+/* Parse a raw byte value in hex format */
+static clib_error_t *
+parse_hex_byte(unformat_input_t *input, u8 **value, u8 **mask, u8 offset, u8 len)
+{
+  u8 i, byte_val;
+  
+  if (!*value) {
+    *value = vec_new(u8, len);
+    *mask = vec_new(u8, len);
+  }
+  
+  for (i = 0; i < len; i++) {
+    if (!unformat(input, "%x", &byte_val)) {
+      return clib_error_return(0, "Invalid hex byte format");
+    }
+    
+    (*value)[offset + i] = byte_val;
+    (*mask)[offset + i] = 0xFF;  /* Exact match for hex */
+  }
+  
+  return 0;
+}
+
+/* Create an IPv4 5-tuple filter */
+static clib_error_t *
+create_ipv4_5tuple_filter(unformat_input_t *input, geneve_tuple_filter_t *filter)
+{
+  clib_error_t *error = NULL;
+  u8 *value = NULL;
+  u8 *mask = NULL;
+  
+  /* Initialize with default size for IPv4 5-tuple */
+  vec_validate(value, 12 - 1);  /* 12 = IPv4 protocol (1) + src/dst IP (8) + src/dst port (4) */
+  vec_validate(mask, 12 - 1);
+  
+  /* Default mask is all 0's (don't care) */
+  memset(mask, 0, vec_len(mask));
+  
+  /* Parse fields in any order */
+  while (unformat_check_input(input) != UNFORMAT_END_OF_INPUT) {
+    if (unformat(input, "src-ip %U", unformat_vlib_cli_sub_input, &parse_ipv4_prefix, &value, &mask)) {
+      /* Source IP already parsed */
+    } else if (unformat(input, "dst-ip %U", unformat_vlib_cli_sub_input, &parse_ipv4_prefix, &value, &mask)) {
+      /* Destination IP already parsed */
+    } else if (unformat(input, "src-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 8)) {
+      /* Source port already parsed */
+    } else if (unformat(input, "dst-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 10)) {
+      /* Destination port already parsed */
+    } else if (unformat(input, "proto %U", unformat_vlib_cli_sub_input, &parse_protocol, &value, &mask, 0)) {
+      /* Protocol already parsed */
+    } else if (unformat(input, "raw %U", unformat_vlib_cli_sub_input, &parse_hex_byte, &value, &mask, 0, vec_len(value))) {
+      /* Raw hex value parsed */
+    } else {
+      error = clib_error_return(0, "Unknown input: %U", format_unformat_error, input);
+      goto done;
+    }
+  }
+  
+  /* Store the results */
+  filter->value = value;
+  filter->mask = mask;
+  filter->length = vec_len(value);
+  
+  return 0;
+  
+done:
+  vec_free(value);
+  vec_free(mask);
+  return error;
+}
+
+/* Create an IPv6 5-tuple filter */
+static clib_error_t *
+create_ipv6_5tuple_filter(unformat_input_t *input, geneve_tuple_filter_t *filter)
+{
+  clib_error_t *error = NULL;
+  u8 *value = NULL;
+  u8 *mask = NULL;
+  
+  /* Initialize with default size for IPv6 5-tuple */
+  vec_validate(value, 36 - 1);  /* 36 = IPv6 protocol (1) + src/dst IP (32) + src/dst port (4) */
+  vec_validate(mask, 36 - 1);
+  
+  /* Default mask is all 0's (don't care) */
+  memset(mask, 0, vec_len(mask));
+  
+  /* Parse fields in any order */
+  while (unformat_check_input(input) != UNFORMAT_END_OF_INPUT) {
+    if (unformat(input, "src-ip %U", unformat_vlib_cli_sub_input, &parse_ipv6_prefix, &value, &mask)) {
+      /* Source IP already parsed */
+    } else if (unformat(input, "dst-ip %U", unformat_vlib_cli_sub_input, &parse_ipv6_prefix, &value, &mask)) {
+      /* Destination IP already parsed */
+    } else if (unformat(input, "src-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 32)) {
+      /* Source port already parsed */
+    } else if (unformat(input, "dst-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 34)) {
+      /* Destination port already parsed */
+    } else if (unformat(input, "proto %U", unformat_vlib_cli_sub_input, &parse_protocol, &value, &mask, 0)) {
+      /* Protocol already parsed */
+    } else if (unformat(input, "raw %U", unformat_vlib_cli_sub_input, &parse_hex_byte, &value, &mask, 0, vec_len(value))) {
+      /* Raw hex value parsed */
+    } else {
+      error = clib_error_return(0, "Unknown input: %U", format_unformat_error, input);
+      goto done;
+    }
+  }
+  
+  /* Store the results */
+  filter->value = value;
+  filter->mask = mask;
+  filter->length = vec_len(value);
+  
+  return 0;
+  
+done:
+  vec_free(value);
+  vec_free(mask);
+  return error;
+}
+
+/******************************************************************************
  * API and initialization
  ******************************************************************************/
 
 static u32 random_seed = 42;
 
 int
-geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter)
+geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter, u8 is_global)
 {
   geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
   geneve_capture_filter_t *new_filter;
   u32 filter_id;
   
-  /* Validate sw_if_index */
-  if (sw_if_index == ~0)
-    return VNET_API_ERROR_INVALID_SW_IF_INDEX;
-    
-  /* Ensure we have space for this interface */
-  vec_validate (gpm->per_interface, sw_if_index);
+  /* For global filter, sw_if_index is ignored */
+  if (!is_global) {
+    /* Validate sw_if_index */
+    if (sw_if_index == ~0)
+      return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+      
+    /* Ensure we have space for this interface */
+    vec_validate (gpm->per_interface, sw_if_index);
+  }
   
   /* Generate a unique filter ID */
   filter_id = random_u32(&random_seed);
   
-  /* Add the filter */
-  vec_add2 (gpm->per_interface[sw_if_index].filters, new_filter, 1);
+  /* Add the filter to the appropriate list */
+  if (is_global) {
+    vec_add2 (gpm->global_filters, new_filter, 1);
+  } else {
+    vec_add2 (gpm->per_interface[sw_if_index].filters, new_filter, 1);
+  }
   
   /* Copy filter data */
   clib_memcpy (new_filter, filter, sizeof (geneve_capture_filter_t));
@@ -791,7 +1209,6 @@ geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter
             {
               new_filter->option_filters[i].data = 
                 vec_dup_aligned (filter->option_filters[i].data,
-                   //              filter->option_filters[i].data_len,
                                  CLIB_CACHE_LINE_BYTES);
             }
             
@@ -799,24 +1216,96 @@ geneve_pcapng_add_filter (u32 sw_if_index, const geneve_capture_filter_t *filter
             {
               new_filter->option_filters[i].mask = 
                 vec_dup_aligned (filter->option_filters[i].mask,
-                    //             filter->option_filters[i].data_len,
                                  CLIB_CACHE_LINE_BYTES);
             }
         }
     }
     
+  /* Copy 5-tuple filters */
+  if (filter->outer_tuple_present)
+    {
+      new_filter->outer_tuple_present = 1;
+      new_filter->outer_tuple.value = vec_dup (filter->outer_tuple.value);
+      new_filter->outer_tuple.mask = vec_dup (filter->outer_tuple.mask);
+      new_filter->outer_tuple.length = filter->outer_tuple.length;
+    }
+    
+  if (filter->inner_tuple_present)
+    {
+      new_filter->inner_tuple_present = 1;
+      new_filter->inner_tuple.value = vec_dup (filter->inner_tuple.value);
+      new_filter->inner_tuple.mask = vec_dup (filter->inner_tuple.mask);
+      new_filter->inner_tuple.length = filter->inner_tuple.length;
+    }
+    
   return filter_id;
 }
 
+int
+geneve_pcapng_del_filter (u32 sw_if_index, u32 filter_id, u8 is_global)
+{
+  geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
+  geneve_capture_filter_t *filters;
+  int i;
+  
+  /* Select filter list based on scope */
+  if (is_global) {
+    filters = gpm->global_filters;
+  } else {
+    /* Check interface exists */
+    if (sw_if_index >= vec_len(gpm->per_interface))
+      return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+      
+    filters = gpm->per_interface[sw_if_index].filters;
+  }
+  
+  /* Find and remove the filter with matching ID */
+  for (i = 0; i < vec_len(filters); i++) {
+    if (filters[i].filter_id == filter_id) {
+      /* Cleanup option filters */
+      if (filters[i].option_filters) {
+        int j;
+        for (j = 0; j < vec_len(filters[i].option_filters); j++) {
+          if (filters[i].option_filters[j].option_name)
+            vec_free (filters[i].option_filters[j].option_name);
+          if (filters[i].option_filters[j].data)
+            vec_free (filters[i].option_filters[j].data);
+          if (filters[i].option_filters[j].mask)
+            vec_free (filters[i].option_filters[j].mask);
+        }
+        vec_free (filters[i].option_filters);
+      }
+      
+      /* Cleanup 5-tuple filters */
+      if (filters[i].outer_tuple_present) {
+        vec_free (filters[i].outer_tuple.value);
+        vec_free (filters[i].outer_tuple.mask);
+      }
+      
+      if (filters[i].inner_tuple_present) {
+        vec_free (filters[i].inner_tuple.value);
+        vec_free (filters[i].inner_tuple.mask);
+      }
+      
+      /* Remove the filter from the vector */
+      if (is_global) {
+        vec_delete (gpm->global_filters, 1, i);
+      } else {
+        vec_delete (gpm->per_interface[sw_if_index].filters, 1, i);
+      }
+      
+      return 0;
+    }
+  }
+  
+  return VNET_API_ERROR_NO_SUCH_ENTRY;
+}
 
 int
 geneve_pcapng_enable_capture (u32 sw_if_index, u8 enable)
 {
   geneve_pcapng_main_t *gmp = &geneve_pcapng_main;
   vnet_main_t *vnm = vnet_get_main ();
-  // vnet_feature_config_main_t *cm;
-  // vnet_config_main_t *vcm;
-  // u8 feature_index;
 
   /* Validate interface index */
   vnet_hw_interface_t *hw = vnet_get_sup_hw_interface (vnm, sw_if_index);
@@ -829,13 +1318,6 @@ geneve_pcapng_enable_capture (u32 sw_if_index, u8 enable)
   /* Update the enabled state */
   gmp->per_interface[sw_if_index].capture_enabled = enable;
 
-  /* Get the feature config for interface-output feature arc */
-  // cm = &vnm->vnet_features[VNET_MAIN_THREAD /* or vnet_worker_thread_barrier_async (m) */].interface_output_feature_config;
-  // vcm = &cm->config_main;
-
-  /* Get the feature index for our capture node */
-  // feature_index = vnet_feature_get_config_index_by_node_name (vnm, "interface-output", "geneve-pcapng-capture");
-
   if (enable)
     {
       /* Enable the feature on this interface */
@@ -847,13 +1329,6 @@ geneve_pcapng_enable_capture (u32 sw_if_index, u8 enable)
       /* Disable the feature on this interface */
       vnet_feature_enable_disable ("interface-output", "geneve-pcapng-capture",
                                    sw_if_index, 0, 0, 0);
-
-      /* Clean up any resources for this interface */
-      if (vec_len (gmp->per_interface[sw_if_index].filters) > 0)
-        {
-          /* Optionally: Clear all filters when disabling capture */
-          /* vec_free (gmp->per_interface[sw_if_index].filters); */
-        }
     }
 
   return 0;
@@ -911,6 +1386,290 @@ geneve_pcapng_enable_command_fn (vlib_main_t * vm,
 done:
   unformat_free (line_input);
   return error;
+}
+
+/* Format a 5-tuple filter for display */
+static u8 *
+format_tuple_filter (u8 *s, va_list *args)
+{
+  geneve_tuple_filter_t *filter = va_arg (*args, geneve_tuple_filter_t *);
+  u8 is_ipv6 = va_arg (*args, int);
+  int i;
+  
+  /* Display raw hex values first */
+  s = format (s, "  Raw bytes (%d): ", filter->length);
+  for (i = 0; i < filter->length; i++)
+    {
+      s = format (s, "%02x", filter->value[i]);
+      if (i < filter->length - 1)
+        s = format (s, " ");
+    }
+  s = format (s, "\n");
+  
+  s = format (s, "  Mask bytes: ");
+  for (i = 0; i < filter->length; i++)
+    {
+      s = format (s, "%02x", filter->mask[i]);
+      if (i < filter->length - 1)
+        s = format (s, " ");
+    }
+  s = format (s, "\n");
+  
+  /* Try to interpret fields in a meaningful way */
+  /* Protocol */
+  if (filter->length > 0 && filter->mask[0])
+    {
+      u8 proto = filter->value[0];
+      s = format (s, "  Protocol: ");
+      if (proto == IP_PROTOCOL_TCP)
+        s = format (s, "TCP (6)\n");
+      else if (proto == IP_PROTOCOL_UDP)
+        s = format (s, "UDP (17)\n");
+      else if (proto == IP_PROTOCOL_ICMP)
+        s = format (s, "ICMP (1)\n");
+      else if (proto == IP_PROTOCOL_ICMP6)
+        s = format (s, "ICMPv6 (58)\n");
+      else
+        s = format (s, "%d\n", proto);
+    }
+  
+  /* IP addresses - offset and format based on IPv4 or IPv6 */
+  if (is_ipv6)
+    {
+      /* IPv6 source address (bytes 1-16) */
+      u8 has_src_ip = 0;
+      for (i = 0; i < 16; i++)
+        {
+          if (filter->mask[i + 1])
+            {
+              has_src_ip = 1;
+              break;
+            }
+        }
+      
+      if (has_src_ip)
+        {
+          ip6_address_t src_ip;
+          memcpy (&src_ip, filter->value +1, 16);
+          s = format (s, "  Source IP: %U", format_ip6_address, &src_ip);
+          
+          /* Check for prefix/mask and display it */
+          u8 prefix_len = 128;
+          for (i = 0; i < 16; i++)
+            {
+              if (filter->mask[i + 1] != 0xFF)
+                {
+                  if (filter->mask[i + 1] == 0)
+                    {
+                      prefix_len = i * 8;
+                      break;
+                    }
+                  else
+                    {
+                      /* Calculate bits in this byte */
+                      u8 mask = filter->mask[i + 1];
+                      u8 bits = 0;
+                      while (mask & 0x80)
+                        {
+                          bits++;
+                          mask <<= 1;
+                        }
+                      prefix_len = i * 8 + bits;
+                      break;
+                    }
+                }
+            }
+          
+          if (prefix_len < 128)
+            s = format (s, "/%d", prefix_len);
+          s = format (s, "\n");
+        }
+      
+      /* IPv6 destination address (bytes 17-32) */
+      u8 has_dst_ip = 0;
+      for (i = 0; i < 16; i++)
+        {
+          if (filter->mask[i + 17])
+            {
+              has_dst_ip = 1;
+              break;
+            }
+        }
+      
+      if (has_dst_ip)
+        {
+          ip6_address_t dst_ip;
+          memcpy (&dst_ip, filter->value + 17, 16);
+          s = format (s, "  Dest IP: %U", format_ip6_address, &dst_ip);
+          
+          /* Check for prefix/mask and display it */
+          u8 prefix_len = 128;
+          for (i = 0; i < 16; i++)
+            {
+              if (filter->mask[i + 17] != 0xFF)
+                {
+                  if (filter->mask[i + 17] == 0)
+                    {
+                      prefix_len = i * 8;
+                      break;
+                    }
+                  else
+                    {
+                      /* Calculate bits in this byte */
+                      u8 mask = filter->mask[i + 17];
+                      u8 bits = 0;
+                      while (mask & 0x80)
+                        {
+                          bits++;
+                          mask <<= 1;
+                        }
+                      prefix_len = i * 8 + bits;
+                      break;
+                    }
+                }
+            }
+          
+          if (prefix_len < 128)
+            s = format (s, "/%d", prefix_len);
+          s = format (s, "\n");
+        }
+      
+      /* Ports */
+      if (filter->length >= 34 && (filter->mask[32] || filter->mask[33]))
+        {
+          u16 src_port;
+          memcpy (&src_port, filter->value + 32, 2);
+          src_port = clib_net_to_host_u16 (src_port);
+          s = format (s, "  Source Port: %d\n", src_port);
+        }
+      
+      if (filter->length >= 36 && (filter->mask[34] || filter->mask[35]))
+        {
+          u16 dst_port;
+          memcpy (&dst_port, filter->value + 34, 2);
+          dst_port = clib_net_to_host_u16 (dst_port);
+          s = format (s, "  Dest Port: %d\n", dst_port);
+        }
+    }
+  else
+    {
+      /* IPv4 source address (bytes 1-4) */
+      u8 has_src_ip = 0;
+      for (i = 0; i < 4; i++)
+        {
+          if (filter->mask[i + 1])
+            {
+              has_src_ip = 1;
+              break;
+            }
+        }
+      
+      if (has_src_ip)
+        {
+          ip4_address_t src_ip;
+          memcpy (&src_ip, filter->value + 1, 4);
+          s = format (s, "  Source IP: %U", format_ip4_address, &src_ip);
+          
+          /* Check for prefix/mask and display it */
+          u8 prefix_len = 32;
+          for (i = 0; i < 4; i++)
+            {
+              if (filter->mask[i + 1] != 0xFF)
+                {
+                  if (filter->mask[i + 1] == 0)
+                    {
+                      prefix_len = i * 8;
+                      break;
+                    }
+                  else
+                    {
+                      /* Calculate bits in this byte */
+                      u8 mask = filter->mask[i + 1];
+                      u8 bits = 0;
+                      while (mask & 0x80)
+                        {
+                          bits++;
+                          mask <<= 1;
+                        }
+                      prefix_len = i * 8 + bits;
+                      break;
+                    }
+                }
+            }
+          
+          if (prefix_len < 32)
+            s = format (s, "/%d", prefix_len);
+          s = format (s, "\n");
+        }
+      
+      /* IPv4 destination address (bytes 5-8) */
+      u8 has_dst_ip = 0;
+      for (i = 0; i < 4; i++)
+        {
+          if (filter->mask[i + 5])
+            {
+              has_dst_ip = 1;
+              break;
+            }
+        }
+      
+      if (has_dst_ip)
+        {
+          ip4_address_t dst_ip;
+          memcpy (&dst_ip, filter->value + 5, 4);
+          s = format (s, "  Dest IP: %U", format_ip4_address, &dst_ip);
+          
+          /* Check for prefix/mask and display it */
+          u8 prefix_len = 32;
+          for (i = 0; i < 4; i++)
+            {
+              if (filter->mask[i + 5] != 0xFF)
+                {
+                  if (filter->mask[i + 5] == 0)
+                    {
+                      prefix_len = i * 8;
+                      break;
+                    }
+                  else
+                    {
+                      /* Calculate bits in this byte */
+                      u8 mask = filter->mask[i + 5];
+                      u8 bits = 0;
+                      while (mask & 0x80)
+                        {
+                          bits++;
+                          mask <<= 1;
+                        }
+                      prefix_len = i * 8 + bits;
+                      break;
+                    }
+                }
+            }
+          
+          if (prefix_len < 32)
+            s = format (s, "/%d", prefix_len);
+          s = format (s, "\n");
+        }
+      
+      /* Ports */
+      if (filter->length >= 10 && (filter->mask[8] || filter->mask[9]))
+        {
+          u16 src_port;
+          memcpy (&src_port, filter->value + 8, 2);
+          src_port = clib_net_to_host_u16 (src_port);
+          s = format (s, "  Source Port: %d\n", src_port);
+        }
+      
+      if (filter->length >= 12 && (filter->mask[10] || filter->mask[11]))
+        {
+          u16 dst_port;
+          memcpy (&dst_port, filter->value + 10, 2);
+          dst_port = clib_net_to_host_u16 (dst_port);
+          s = format (s, "  Dest Port: %d\n", dst_port);
+        }
+    }
+  
+  return s;
 }
 
 /* Register with preferred data type */
@@ -1060,6 +1819,7 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
   geneve_capture_filter_t filter = {0};
   u32 sw_if_index = ~0;
   u8 is_add = 1;
+  u8 is_global = 0;
   u32 filter_id = ~0;
   char * option_name = 0;
   
@@ -1072,6 +1832,8 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
       if (unformat (line_input, "interface %U",
                    unformat_vnet_sw_interface, vnm, &sw_if_index))
         ;
+      else if (unformat (line_input, "global"))
+        is_global = 1;
       else if (unformat (line_input, "del"))
         is_add = 0;
       else if (unformat (line_input, "id %d", &filter_id))
@@ -1084,6 +1846,26 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
         filter.proto_present = 1;
       else if (unformat (line_input, "vni %d", &filter.vni))
         filter.vni_present = 1;
+      else if (unformat (line_input, "outer-ipv4 %U", 
+                        unformat_vlib_cli_sub_input, &create_ipv4_5tuple_filter, &filter.outer_tuple))
+        {
+          filter.outer_tuple_present = 1;
+        }
+      else if (unformat (line_input, "outer-ipv6 %U", 
+                        unformat_vlib_cli_sub_input, &create_ipv6_5tuple_filter, &filter.outer_tuple))
+        {
+          filter.outer_tuple_present = 1;
+        }
+      else if (unformat (line_input, "inner-ipv4 %U", 
+                        unformat_vlib_cli_sub_input, &create_ipv4_5tuple_filter, &filter.inner_tuple))
+        {
+          filter.inner_tuple_present = 1;
+        }
+      else if (unformat (line_input, "inner-ipv6 %U", 
+                        unformat_vlib_cli_sub_input, &create_ipv6_5tuple_filter, &filter.inner_tuple))
+        {
+          filter.inner_tuple_present = 1;
+        }
       else if (unformat (line_input, "option %s", &option_name))
         {
           /* Create option filter */
@@ -1224,6 +2006,43 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
                   opt_filter.match_any = 1;
                 }
             }
+          else
+            {
+              /* Option is not registered, handle raw data */
+              if (unformat (line_input, "any"))
+                {
+                  opt_filter.match_any = 1;
+                }
+              else if (unformat (line_input, "length %d", &opt_filter.data_len))
+                {
+                  if (unformat (line_input, "value"))
+                    {
+                      error = parse_option_data (line_input, GENEVE_OPT_TYPE_RAW,
+                                              &opt_filter.data, opt_filter.data_len);
+                      if (error)
+                        goto done;
+                        
+                      /* Check for mask */
+                      if (unformat (line_input, "mask"))
+                        {
+                          error = parse_option_data (line_input, GENEVE_OPT_TYPE_RAW,
+                                                &opt_filter.mask, opt_filter.data_len);
+                          if (error)
+                            goto done;
+                        }
+                    }
+                  else
+                    {
+                      /* Default to match any if no value provided */
+                      opt_filter.match_any = 1;
+                    }
+                }
+              else
+                {
+                  /* No length specified, default to match any */
+                  opt_filter.match_any = 1;
+                }
+            }
             
           /* Add the option filter to the vector */
           vec_add1 (filter.option_filters, opt_filter);
@@ -1237,9 +2056,9 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
     }
     
   /* Validate inputs */
-  if (sw_if_index == ~0)
+  if (!is_global && sw_if_index == ~0)
     {
-      error = clib_error_return (0, "interface required");
+      error = clib_error_return (0, "interface required for interface filter");
       goto done;
     }
     
@@ -1252,28 +2071,62 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
   /* Add/delete filter */
   if (is_add)
     {
-      filter_id = geneve_pcapng_add_filter (sw_if_index, &filter);
+      filter_id = geneve_pcapng_add_filter (sw_if_index, &filter, is_global);
       if (filter_id < 0)
         {
           error = clib_error_return (0, "failed to add filter");
           goto done;
         }
         
-      vlib_cli_output (vm, "Added GENEVE filter with ID: %d", filter_id);
+      vlib_cli_output (vm, "Added GENEVE %s filter with ID: %d", 
+                      is_global ? "global" : "interface", filter_id);
     }
   else
     {
-      int rv = geneve_pcapng_del_filter (sw_if_index, filter_id);
+      int rv = geneve_pcapng_del_filter (sw_if_index, filter_id, is_global);
       if (rv < 0)
         {
           error = clib_error_return (0, "failed to delete filter (id: %d)", filter_id);
           goto done;
         }
         
-      vlib_cli_output (vm, "Deleted GENEVE filter with ID: %d", filter_id);
+      vlib_cli_output (vm, "Deleted GENEVE %s filter with ID: %d", 
+                      is_global ? "global" : "interface", filter_id);
     }
     
 done:
+  /* Cleanup if error */
+  if (error && is_add)
+    {
+      /* Clean up filter resources */
+      if (filter.option_filters)
+        {
+          int i;
+          for (i = 0; i < vec_len (filter.option_filters); i++)
+            {
+              if (filter.option_filters[i].option_name)
+                vec_free (filter.option_filters[i].option_name);
+              if (filter.option_filters[i].data)
+                vec_free (filter.option_filters[i].data);
+              if (filter.option_filters[i].mask)
+                vec_free (filter.option_filters[i].mask);
+            }
+          vec_free (filter.option_filters);
+        }
+        
+      if (filter.outer_tuple_present)
+        {
+          vec_free (filter.outer_tuple.value);
+          vec_free (filter.outer_tuple.mask);
+        }
+        
+      if (filter.inner_tuple_present)
+        {
+          vec_free (filter.inner_tuple.value);
+          vec_free (filter.inner_tuple.mask);
+        }
+    }
+    
   unformat_free (line_input);
   return error;
 }
@@ -1281,7 +2134,9 @@ done:
 /* Updated CLI command for better help text */
 VLIB_CLI_COMMAND (geneve_pcapng_filter_command, static) = {
   .path = "geneve pcapng filter",
-  .short_help = "geneve pcapng filter interface <interface> [ver <ver>] [opt-len <len>] [protocol <proto>] [vni <vni>] "
+  .short_help = "geneve pcapng filter [interface <interface> | global] "
+                "[ver <ver>] [opt-len <len>] [protocol <proto>] [vni <vni>] "
+                "[outer-ipv4 | outer-ipv6 | inner-ipv4 | inner-ipv6] "
                 "[option <name> [any|value [raw|ipv4|ipv6|uint8|uint16|uint32|string] <data> [mask <mask>]]] "
                 "[option-direct class <class> type <type> [any|value [raw|ipv4|ipv6|uint8|uint16|uint32|string] <data> [mask <mask>]]] "
                 "[del id <id>]",
@@ -1574,7 +2429,150 @@ geneve_pcapng_show_filters_command_fn (vlib_main_t * vm,
   
   vlib_cli_output (vm, "GENEVE Capture Filters:");
   
-  /* Display filters for each interface */
+  /* Display global filters first */
+  if (vec_len (gpm->global_filters) > 0)
+    {
+      vlib_cli_output (vm, "\nGlobal Filters:");
+      
+      for (i = 0; i < vec_len (gpm->global_filters); i++)
+        {
+          geneve_capture_filter_t *filter = &gpm->global_filters[i];
+          
+          vlib_cli_output (vm, "  Filter ID: %u", filter->filter_id);
+          
+          /* Basic header filters */
+          if (filter->ver_present)
+            vlib_cli_output (vm, "    Version: %u", filter->ver);
+            
+          if (filter->opt_len_present)
+            vlib_cli_output (vm, "    Option Length: %u", filter->opt_len);
+            
+          if (filter->proto_present)
+            vlib_cli_output (vm, "    Protocol: 0x%04x", filter->protocol);
+            
+          if (filter->vni_present)
+            vlib_cli_output (vm, "    VNI: %u", filter->vni);
+            
+          /* 5-tuple filters */
+          if (filter->outer_tuple_present)
+            {
+              vlib_cli_output (vm, "    Outer 5-tuple filter:");
+              vlib_cli_output (vm, "%U", format_tuple_filter, 
+                             &filter->outer_tuple, 
+                             filter->outer_tuple.length > 20); /* is_ipv6 */
+            }
+            
+          if (filter->inner_tuple_present)
+            {
+              vlib_cli_output (vm, "    Inner 5-tuple filter:");
+              vlib_cli_output (vm, "%U", format_tuple_filter, 
+                             &filter->inner_tuple,
+                             filter->inner_tuple.length > 20); /* is_ipv6 */
+            }
+            
+          /* Option filters */
+          if (filter->option_filters)
+            {
+              vlib_cli_output (vm, "    Option Filters:");
+              
+              for (j = 0; j < vec_len (filter->option_filters); j++)
+                {
+                  if (!filter->option_filters[j].present)
+                    continue;
+                    
+                  /* Determine option details */
+                  u16 opt_class;
+                  u8 opt_type;
+                  char *name = NULL;
+                  geneve_opt_data_type_t data_type = GENEVE_OPT_TYPE_RAW;
+                  
+                  if (filter->option_filters[j].option_name)
+                    {
+                      /* Look up registered option by name */
+                      uword *p = hash_get_mem (gpm->option_by_name, 
+                                             filter->option_filters[j].option_name);
+                      if (p)
+                        {
+                          geneve_option_def_t *opt_def = &gpm->option_defs[p[0]];
+                          opt_class = opt_def->opt_class;
+                          opt_type = opt_def->type;
+                          name = opt_def->option_name;
+                          data_type = opt_def->preferred_type;
+                        }
+                      else
+                        {
+                          /* This shouldn't happen if validation was done at filter creation */
+                          opt_class = 0;
+                          opt_type = 0;
+                          name = (char *)filter->option_filters[j].option_name;
+                        }
+                    }
+                  else
+                    {
+                      /* Direct class/type specification */
+                      opt_class = filter->option_filters[j].opt_class;
+                      opt_type = filter->option_filters[j].type;
+                      
+                      /* Try to find a registered name for this option */
+                      u64 key = ((u64)opt_class << 8) | opt_type;
+                      uword *p = hash_get (gpm->option_by_class_type, key);
+                      if (p)
+                        {
+                          geneve_option_def_t *opt_def = &gpm->option_defs[p[0]];
+                          name = opt_def->option_name;
+                          data_type = opt_def->preferred_type;
+                        }
+                    }
+                    
+                  /* Output option filter details */
+                  if (name)
+                    vlib_cli_output (vm, "      Option: %s (class=0x%x, type=0x%x)",
+                                    name, opt_class, opt_type);
+                  else
+                    vlib_cli_output (vm, "      Option: class=0x%x, type=0x%x",
+                                    opt_class, opt_type);
+                                    
+                  if (filter->option_filters[j].match_any)
+                    {
+                      vlib_cli_output (vm, "        Match: Any (presence only)");
+                    }
+                  else if (filter->option_filters[j].data)
+                    {
+                      /* Show data in both formatted and raw forms */
+                      vlib_cli_output (vm, "        Match Value: %U",
+                                      format_option_data,
+                                      filter->option_filters[j].data,
+                                      filter->option_filters[j].data_len,
+                                      data_type);
+                                      
+                      /* For non-raw types, also show raw bytes */
+                      if (data_type != GENEVE_OPT_TYPE_RAW)
+                        {
+                          vlib_cli_output (vm, "        Raw Bytes: %U",
+                                          format_option_data,
+                                          filter->option_filters[j].data,
+                                          filter->option_filters[j].data_len,
+                                          GENEVE_OPT_TYPE_RAW);
+                        }
+                        
+                      /* Show mask if present */
+                      if (filter->option_filters[j].mask)
+                        {
+                          vlib_cli_output (vm, "        Mask: %U",
+                                          format_option_data,
+                                          filter->option_filters[j].mask,
+                                          filter->option_filters[j].data_len,
+                                          GENEVE_OPT_TYPE_RAW);
+                        }
+                    }
+                }
+            }
+          
+          filters_displayed++;
+        }
+    }
+  
+  /* Display per-interface filters */
   for (sw_if_index = 0; sw_if_index < vec_len (gpm->per_interface); sw_if_index++)
     {
       if (gpm->per_interface[sw_if_index].filters == 0)
@@ -1612,6 +2610,23 @@ geneve_pcapng_show_filters_command_fn (vlib_main_t * vm,
             
           if (filter->vni_present)
             vlib_cli_output (vm, "    VNI: %u", filter->vni);
+            
+          /* 5-tuple filters */
+          if (filter->outer_tuple_present)
+            {
+              vlib_cli_output (vm, "    Outer 5-tuple filter:");
+              vlib_cli_output (vm, "%U", format_tuple_filter, 
+                             &filter->outer_tuple, 
+                             filter->outer_tuple.length > 20); /* is_ipv6 */
+            }
+            
+          if (filter->inner_tuple_present)
+            {
+              vlib_cli_output (vm, "    Inner 5-tuple filter:");
+              vlib_cli_output (vm, "%U", format_tuple_filter, 
+                             &filter->inner_tuple,
+                             filter->inner_tuple.length > 20); /* is_ipv6 */
+            }
             
           /* Option filters */
           if (filter->option_filters)
@@ -1842,6 +2857,9 @@ geneve_pcapng_init (vlib_main_t * vm)
   gpm->option_by_name = hash_create_string (0, sizeof (uword));
   gpm->option_by_class_type = hash_create (0, sizeof (uword));
 
+  /* Initialize the global filter vector */
+  gpm->global_filters = 0; /* Empty vector */
+
   /* Set up default file output implementation */
   geneve_pcapng_output_init (gpm);
 
@@ -1876,4 +2894,3 @@ VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,
   .description = "Geneve Tunnel Packet Capture plugin",
 };
-
