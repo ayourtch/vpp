@@ -238,7 +238,8 @@ format_geneve_protocol(u8 *s, va_list *args)
 static u8 *
 format_udp_port(u8 *s, va_list *args)
 {
-  u16 port = va_arg(*args, int);  /* promoted to int */
+  u16 *pport = va_arg(*args, u16 *);  /* promoted to int */
+  u16 port = *pport;
   port = clib_net_to_host_u16(port);
   
   switch (port)
@@ -269,7 +270,8 @@ format_udp_port(u8 *s, va_list *args)
 static u8 *
 format_tcp_port(u8 *s, va_list *args)
 {
-  u16 port = va_arg(*args, int);  /* promoted to int */
+  u16 *pport = va_arg(*args, u16 *);
+  u16 port = *pport;
   port = clib_net_to_host_u16(port);
   
   switch (port)
