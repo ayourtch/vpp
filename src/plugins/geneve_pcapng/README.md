@@ -184,6 +184,42 @@ Interface: GigabitEthernet0/1/0 (idx 1) - Capture enabled
         Raw Bytes: 00 00 00 2a
 ```
 
+#### Show Captured Packets
+
+```
+show geneve pcapng capture <filename> [max-packets <count>] [verbose]
+```
+
+This command displays packets captured in PCAPng files with detailed GENEVE parsing.
+
+**Parameters:**
+- `filename`: Path to the PCAPng file to display
+- `max-packets <count>`: Optional maximum number of packets to display
+- `verbose`: Optional flag to display additional PCAPng structure information
+
+**Example output:**
+```
+vpp# show geneve pcapng capture /tmp/geneve_capture_worker0.pcapng
+
+Packet #1: timestamp=1652938275612, len=142, interface=GigabitEthernet0/1/0 (1)
+Ethernet: 00:50:56:ae:b2:3f -> 00:50:56:ae:cc:1d, type=0x0800
+  IPv4: 192.168.10.5 -> 10.0.0.10, len=128, ttl=64, protocol=17
+  UDP: src_port=52431, dst_port=6081 (GENEVE), len=108, checksum=0x1234
+  GENEVE: ver=0, opt_len=0 (words), 0 (bytes), protocol=IPv4 (0x0800), VNI=100 (0x64)
+      Inner IPv4: 192.168.1.5 -> 10.0.0.5, len=84, proto=6
+      Inner TCP: src_port=53123, dst_port=80 (HTTP), flags=SYN
+
+Packet #2: timestamp=1652938275614, len=142, interface=GigabitEthernet0/1/0 (1)
+Ethernet: 00:50:56:ae:cc:1d -> 00:50:56:ae:b2:3f, type=0x0800
+  IPv4: 10.0.0.10 -> 192.168.10.5, len=128, ttl=64, protocol=17
+  UDP: src_port=6081 (GENEVE), dst_port=52431, len=108, checksum=0x5678
+  GENEVE: ver=0, opt_len=0 (words), 0 (bytes), protocol=IPv4 (0x0800), VNI=100 (0x64)
+      Inner IPv4: 10.0.0.5 -> 192.168.1.5, len=84, proto=6
+      Inner TCP: src_port=80 (HTTP), dst_port=53123, flags=SYN,ACK
+
+Total packets displayed: 2
+```
+
 ### Output Configuration
 
 ```

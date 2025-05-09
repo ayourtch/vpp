@@ -9,11 +9,12 @@
 #include <vpp/app/version.h>
 #include <vnet/udp/udp_packet.h>
 #include <vnet/ethernet/ethernet.h>
+#include <vnet/ip/ip.h>
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/tcp/tcp_packet.h>
-#include <vnet/icmp/icmp4.h>
-#include <vnet/icmp/icmp6.h>
+#include <vnet/ip/icmp4.h>
+#include <vnet/ip/icmp6.h>
 #include <vppinfra/error.h>
 #include <vlib/vlib.h>
 
@@ -746,7 +747,7 @@ format_geneve_packet(u8 *s, va_list *args)
         
         s = format(s, "  IPv6: %U -> %U, len=%d, hop_limit=%d, protocol=%d\n",
                    format_ip6_address, &ip->src_address,
-                   formatformat_ip6_address, &ip->dst_address,
+                   format_ip6_address, &ip->dst_address,
                    clib_net_to_host_u16(ip->payload_length),
                    ip->hop_limit,
                    ip->protocol);

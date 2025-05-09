@@ -14,6 +14,7 @@
 add_vpp_plugin(geneve_pcapng
   SOURCES
   main.c
+  show_packets.c
 
   #MULTIARCH_SOURCES
 
