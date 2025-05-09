@@ -673,7 +673,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           ethernet_header_t *ether;
           udp_header_t *udp;
           geneve_header_t *geneve;
-          bool is_ip6;
+          // bool is_ip6;
           bool packet_captured = false;
           
           /* Prefetch next packet */
@@ -716,7 +716,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           if ((ip4->ip_version_and_header_length & 0xF0) == 0x40)
             {
 /* IPv4 */
-              is_ip6 = false;
+              // is_ip6 = false;
               outer_header_len = (ip4->ip_version_and_header_length & 0x0F) * 4;
               
               /* Skip non-UDP packets */
@@ -729,7 +729,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           else if ((ip4->ip_version_and_header_length & 0xF0) == 0x60)
             {
               /* IPv6 */
-              is_ip6 = true;
+              // is_ip6 = true;
               ip6 = (ip6_header_t *)ip4;
               outer_header = (const u8 *)ip6;
               outer_header_len = sizeof(ip6_header_t);
@@ -870,14 +870,12 @@ VNET_FEATURE_INIT (geneve_pcapng_feature, static) = {
 /* Helper functions to parse and format 5-tuple filter data */
 
 /* Convert network prefix to mask */
-static u8 *
-prefix_to_mask(u8 is_ipv6, u8 prefix_len)
+static void
+prefix_to_mask(u8 *mask, u8 is_ipv6, int prefix_len)
 {
-  u8 *mask;
   int i, bytes;
   
   bytes = is_ipv6 ? 16 : 4;
-  mask = vec_new(u8, bytes);
   
   for (i = 0; i < bytes; i++) {
     if (prefix_len >= 8) {
@@ -890,96 +888,92 @@ prefix_to_mask(u8 is_ipv6, u8 prefix_len)
       mask[i] = 0;
     }
   }
-  
-  return mask;
 }
 
 /* Parse IPv4 address with optional prefix */
-static clib_error_t *
-parse_ipv4_prefix(unformat_input_t *input, u8 **value, u8 **mask)
+uword
+parse_ipv4_prefix(unformat_input_t *input, va_list * args)
 {
+  u8 **value = va_arg (*args, u8 **);
+  u8 **mask = va_arg (*args, u8 **);
+  int offset = va_arg (*args, int);
   ip4_address_t ip4;
-  u8 prefix_len = 32;
-  
+  int prefix_len = 32;
+
   if (unformat(input, "%U/%d", unformat_ip4_address, &ip4, &prefix_len)) {
     /* Address with prefix */
-    if (prefix_len > 32)
-      return clib_error_return(0, "IPv4 prefix length must be <= 32");
+    if (prefix_len > 32) {
+      clib_warning("IPv4 prefix length must be <= 32");
+      return 0;
+      }
   } else if (unformat(input, "%U", unformat_ip4_address, &ip4)) {
     /* Just the address */
   } else {
-    return clib_error_return(0, "Invalid IPv4 address format");
+    clib_warning("Invalid IPv4 address format");
+    return 0;
   }
   
   /* Allocate and set value */
-  *value = vec_new(u8, 4);
-  memcpy(*value, &ip4, 4);
+  vec_validate(*value, offset+4-1);
+  vec_validate(*mask, offset+4-1);
+  memcpy(*value + offset, &ip4, 4);
   
   /* Create mask based on prefix length */
-  *mask = prefix_to_mask(0, prefix_len);
+  prefix_to_mask(*mask+offset, 0, prefix_len);
+  clib_warning("Parsed address: %U prefix len %d", format_ip4_address, &ip4, prefix_len);
   
-  return 0;
+  return 1;
 }
 
 /* Parse IPv6 address with optional prefix */
-static clib_error_t *
-parse_ipv6_prefix(unformat_input_t *input, u8 **value, u8 **mask)
+uword
+parse_ipv6_prefix(unformat_input_t *input, va_list * args)
 {
+  u8 **value = va_arg (*args, u8 **);
+  u8 **mask = va_arg (*args, u8 **);
+  int offset = va_arg (*args, int);
   ip6_address_t ip6;
   u8 prefix_len = 128;
   
   if (unformat(input, "%U/%d", unformat_ip6_address, &ip6, &prefix_len)) {
     /* Address with prefix */
-    if (prefix_len > 128)
-      return clib_error_return(0, "IPv6 prefix length must be <= 128");
+    if (prefix_len > 128) {
+      clib_warning("IPv6 prefix length must be <= 128");
+      return 0;
+      }
   } else if (unformat(input, "%U", unformat_ip6_address, &ip6)) {
     /* Just the address */
   } else {
-    return clib_error_return(0, "Invalid IPv6 address format");
+    clib_warning("Invalid IPv6 address format");
+    return 0;
   }
   
   /* Allocate and set value */
-  *value = vec_new(u8, 16);
-  memcpy(*value, &ip6, 16);
+  vec_validate(*value, offset + 16 - 1);
+  vec_validate(*mask, offset + 16 - 1);
+  memcpy(*value + offset, &ip6, 16);
   
   /* Create mask based on prefix length */
-  *mask = prefix_to_mask(1, prefix_len);
+  prefix_to_mask(*mask + offset, 1, prefix_len);
   
-  return 0;
+  return 1;
 }
 
 /* Parse port number or range */
-static clib_error_t *
-parse_port(unformat_input_t *input, u8 **value, u8 **mask, u8 offset)
+uword
+parse_port(unformat_input_t *input, va_list * args)
 {
-  u16 port_lo, port_hi;
+  u8 **value = va_arg (*args, u8 **);
+  u8 **mask = va_arg (*args, u8 **);
+  uword offset = va_arg (*args, uword);
+
+  u32 port_lo = 0;
   
-  if (unformat(input, "%d-%d", &port_lo, &port_hi)) {
-    /* Port range */
-    if (port_lo > port_hi)
-      return clib_error_return(0, "Invalid port range (first > last)");
-      
-    /* For port ranges, we need to generate multiple mask/value combinations
-     * For now, we just match any port in the range by setting mask to 0
-     */
-    if (!*value) {
-      *value = vec_new(u8, 2);
-      *mask = vec_new(u8, 2);
-    }
-    
-    /* Store port in network byte order */
-    port_lo = clib_host_to_net_u16(port_lo);
-    memcpy(*value + offset, &port_lo, 2);
-    
-    /* Mask will be 0 for port range */
-    memset(*mask + offset, 0, 2);
-    
-  } else if (unformat(input, "%d", &port_lo)) {
-    /* Single port */
-    if (!*value) {
-      *value = vec_new(u8, 2);
-      *mask = vec_new(u8, 2);
-    }
+  if (unformat(input, "%d", &port_lo)) {
+    /* the port is two bytes */
+    vec_validate(*value, offset+1);
+    vec_validate(*mask, offset+1);
+    clib_warning("Set offset %d to value %u", offset, port_lo);
     
     /* Store port in network byte order */
     port_lo = clib_host_to_net_u16(port_lo);
@@ -989,17 +983,21 @@ parse_port(unformat_input_t *input, u8 **value, u8 **mask, u8 offset)
     memset(*mask + offset, 0xFF, 2);
     
   } else {
-    return clib_error_return(0, "Invalid port format");
+    return 0;
   }
   
-  return 0;
+  return 1;
 }
 
 /* Parse protocol number */
-static clib_error_t *
-parse_protocol(unformat_input_t *input, u8 **value, u8 **mask, u8 offset)
+uword
+parse_protocol(unformat_input_t *input,  va_list * args)
 {
-  u8 proto;
+  u8 **value = va_arg (*args, u8 **);
+  u8 **mask = va_arg (*args, u8 **);
+  int offset = va_arg (*args, int);
+  clib_warning("protocol offset: %d", offset);
+  u32 proto;
   
   if (unformat(input, "tcp")) {
     proto = IP_PROTOCOL_TCP;
@@ -1012,18 +1010,16 @@ parse_protocol(unformat_input_t *input, u8 **value, u8 **mask, u8 offset)
   } else if (unformat(input, "%d", &proto)) {
     /* Direct protocol number */
   } else {
-    return clib_error_return(0, "Invalid protocol format");
+    return 0;
   }
   
-  if (!*value) {
-    *value = vec_new(u8, 1);
-    *mask = vec_new(u8, 1);
-  }
+  vec_validate(*value, offset);
+  vec_validate(*mask, offset);
   
   (*value)[offset] = proto;
   (*mask)[offset] = 0xFF;  /* Exact match for protocol */
   
-  return 0;
+  return 1;
 }
 
 /* Parse a raw byte value in hex format */
@@ -1032,10 +1028,8 @@ parse_hex_byte(unformat_input_t *input, u8 **value, u8 **mask, u8 offset, u8 len
 {
   u8 i, byte_val;
   
-  if (!*value) {
-    *value = vec_new(u8, len);
-    *mask = vec_new(u8, len);
-  }
+  vec_validate(*value, offset + len - 1);
+  vec_validate(*mask, offset + len - 1);
   
   for (i = 0; i < len; i++) {
     if (!unformat(input, "%x", &byte_val)) {
@@ -1049,34 +1043,39 @@ parse_hex_byte(unformat_input_t *input, u8 **value, u8 **mask, u8 offset, u8 len
   return 0;
 }
 
+#define IP4_SRC_IP_OFFSET 12
+#define IP4_DST_IP_OFFSET 16
+#define IP4_SRC_PORT_OFFSET 20
+#define IP4_DST_PORT_OFFSET 22
+#define IP4_PROTO_OFFSET 9
+
 /* Create an IPv4 5-tuple filter */
 static clib_error_t *
 create_ipv4_5tuple_filter(unformat_input_t *input, geneve_tuple_filter_t *filter)
 {
   clib_error_t *error = NULL;
-  u8 *value = NULL;
-  u8 *mask = NULL;
-  
-  /* Initialize with default size for IPv4 5-tuple */
-  vec_validate(value, 12 - 1);  /* 12 = IPv4 protocol (1) + src/dst IP (8) + src/dst port (4) */
-  vec_validate(mask, 12 - 1);
-  
-  /* Default mask is all 0's (don't care) */
-  memset(mask, 0, vec_len(mask));
+  u8 *value = filter->value;
+  u8 *mask = filter->mask;
+
+  vec_validate(value, 0);
+  vec_validate(mask, 0);
+
+  value[0] = 0x40;
+  mask[0] = 0xf0;
   
   /* Parse fields in any order */
   while (unformat_check_input(input) != UNFORMAT_END_OF_INPUT) {
-    if (unformat(input, "src-ip %U", unformat_vlib_cli_sub_input, &parse_ipv4_prefix, &value, &mask)) {
+    if (unformat(input, "src-ip %U", parse_ipv4_prefix, &value, &mask, IP4_SRC_IP_OFFSET)) {
       /* Source IP already parsed */
-    } else if (unformat(input, "dst-ip %U", unformat_vlib_cli_sub_input, &parse_ipv4_prefix, &value, &mask)) {
+    } else if (unformat(input, "dst-ip %U", parse_ipv4_prefix, &value, &mask, IP4_DST_IP_OFFSET)) {
       /* Destination IP already parsed */
-    } else if (unformat(input, "src-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 8)) {
+    } else if (unformat(input, "src-port %U", parse_port, &value, &mask, IP4_SRC_PORT_OFFSET)) {
       /* Source port already parsed */
-    } else if (unformat(input, "dst-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 10)) {
+    } else if (unformat(input, "dst-port %U", parse_port, &value, &mask, IP4_DST_PORT_OFFSET)) {
       /* Destination port already parsed */
-    } else if (unformat(input, "proto %U", unformat_vlib_cli_sub_input, &parse_protocol, &value, &mask, 0)) {
+    } else if (unformat(input, "proto %U", parse_protocol, &value, &mask, IP4_PROTO_OFFSET)) {
       /* Protocol already parsed */
-    } else if (unformat(input, "raw %U", unformat_vlib_cli_sub_input, &parse_hex_byte, &value, &mask, 0, vec_len(value))) {
+    } else if (unformat(input, "raw %U", parse_hex_byte, &value, &mask, 0, vec_len(value))) {
       /* Raw hex value parsed */
     } else {
       error = clib_error_return(0, "Unknown input: %U", format_unformat_error, input);
@@ -1097,34 +1096,44 @@ done:
   return error;
 }
 
+#define IP6_SRC_IP_OFFSET 8
+#define IP6_DST_IP_OFFSET 24
+#define IP6_SRC_PORT_OFFSET 40
+#define IP6_DST_PORT_OFFSET 42
+#define IP6_PROTO_OFFSET 6
+
 /* Create an IPv6 5-tuple filter */
 static clib_error_t *
 create_ipv6_5tuple_filter(unformat_input_t *input, geneve_tuple_filter_t *filter)
 {
   clib_error_t *error = NULL;
-  u8 *value = NULL;
-  u8 *mask = NULL;
+  u8 *value = filter->value;
+  u8 *mask = filter->mask;
   
-  /* Initialize with default size for IPv6 5-tuple */
-  vec_validate(value, 36 - 1);  /* 36 = IPv6 protocol (1) + src/dst IP (32) + src/dst port (4) */
-  vec_validate(mask, 36 - 1);
+  vec_validate(value, 0);
+  vec_validate(mask, 0);
   
   /* Default mask is all 0's (don't care) */
   memset(mask, 0, vec_len(mask));
+
+  /* IPv6 */
+  value[0] = 0x60;
+  mask[0] = 0xf0;
+
   
   /* Parse fields in any order */
   while (unformat_check_input(input) != UNFORMAT_END_OF_INPUT) {
-    if (unformat(input, "src-ip %U", unformat_vlib_cli_sub_input, &parse_ipv6_prefix, &value, &mask)) {
+    if (unformat(input, "src-ip %U", parse_ipv6_prefix, &value, &mask, IP6_SRC_IP_OFFSET)) {
       /* Source IP already parsed */
-    } else if (unformat(input, "dst-ip %U", unformat_vlib_cli_sub_input, &parse_ipv6_prefix, &value, &mask)) {
+    } else if (unformat(input, "dst-ip %U", parse_ipv6_prefix, &value, &mask, IP6_DST_IP_OFFSET)) {
       /* Destination IP already parsed */
-    } else if (unformat(input, "src-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 32)) {
+    } else if (unformat(input, "src-port %U", parse_port, &value, &mask, IP6_SRC_PORT_OFFSET)) {
       /* Source port already parsed */
-    } else if (unformat(input, "dst-port %U", unformat_vlib_cli_sub_input, &parse_port, &value, &mask, 34)) {
+    } else if (unformat(input, "dst-port %U", parse_port, &value, &mask, IP6_DST_PORT_OFFSET)) {
       /* Destination port already parsed */
-    } else if (unformat(input, "proto %U", unformat_vlib_cli_sub_input, &parse_protocol, &value, &mask, 0)) {
+    } else if (unformat(input, "proto %U", parse_protocol, &value, &mask, IP6_PROTO_OFFSET)) {
       /* Protocol already parsed */
-    } else if (unformat(input, "raw %U", unformat_vlib_cli_sub_input, &parse_hex_byte, &value, &mask, 0, vec_len(value))) {
+    } else if (unformat(input, "raw %U", parse_hex_byte, &value, &mask, 0, vec_len(value))) {
       /* Raw hex value parsed */
     } else {
       error = clib_error_return(0, "Unknown input: %U", format_unformat_error, input);
@@ -1388,59 +1397,76 @@ done:
   return error;
 }
 
+typedef enum {
+   TUPLE_FILTER_UNKNOWN = 0,
+   TUPLE_FILTER_IP4,
+   TUPLE_FILTER_IP6,
+} tuple_filter_t; 
+
 /* Format a 5-tuple filter for display */
 static u8 *
 format_tuple_filter (u8 *s, va_list *args)
 {
   geneve_tuple_filter_t *filter = va_arg (*args, geneve_tuple_filter_t *);
-  u8 is_ipv6 = va_arg (*args, int);
   int i;
   
   /* Display raw hex values first */
-  s = format (s, "  Raw bytes (%d): ", filter->length);
-  for (i = 0; i < filter->length; i++)
+  s = format (s, "        Data bytes (%d): ", vec_len(filter->value));
+  for (i = 0; i < vec_len(filter->value); i++)
     {
       s = format (s, "%02x", filter->value[i]);
-      if (i < filter->length - 1)
+      if (i < vec_len(filter->value) - 1)
         s = format (s, " ");
     }
   s = format (s, "\n");
   
-  s = format (s, "  Mask bytes: ");
-  for (i = 0; i < filter->length; i++)
+  s = format (s, "        Mask bytes (%d): ", vec_len(filter->mask));
+  for (i = 0; i < vec_len(filter->mask); i++)
     {
       s = format (s, "%02x", filter->mask[i]);
-      if (i < filter->length - 1)
+      if (i < vec_len(filter->mask) - 1)
         s = format (s, " ");
     }
   s = format (s, "\n");
   
   /* Try to interpret fields in a meaningful way */
   /* Protocol */
+  int proto_offset = 0; /* should be reset from 0 */
+  int src_port_offset = 0;
+  int dst_port_offset = 0;
+
+  tuple_filter_t filter_type = TUPLE_FILTER_UNKNOWN;
   if (filter->length > 0 && filter->mask[0])
     {
-      u8 proto = filter->value[0];
-      s = format (s, "  Protocol: ");
-      if (proto == IP_PROTOCOL_TCP)
-        s = format (s, "TCP (6)\n");
-      else if (proto == IP_PROTOCOL_UDP)
-        s = format (s, "UDP (17)\n");
-      else if (proto == IP_PROTOCOL_ICMP)
-        s = format (s, "ICMP (1)\n");
-      else if (proto == IP_PROTOCOL_ICMP6)
-        s = format (s, "ICMPv6 (58)\n");
-      else
-        s = format (s, "%d\n", proto);
+      s = format (s, "       ");
+      switch (filter->value[0] & 0xf0) {
+         case 0x40:
+             s = format (s, "IPv4:\n");
+	     proto_offset = IP4_PROTO_OFFSET;
+	     src_port_offset = IP4_SRC_PORT_OFFSET;
+	     dst_port_offset = IP4_DST_PORT_OFFSET;
+	     filter_type = TUPLE_FILTER_IP4;
+	     break;
+	 case 0x60:
+             s = format (s, "IPv6:\n");
+	     proto_offset = IP6_PROTO_OFFSET;
+	     src_port_offset = IP6_SRC_PORT_OFFSET;
+	     dst_port_offset = IP6_DST_PORT_OFFSET;
+	     filter_type = TUPLE_FILTER_IP6;
+	     break;
+      }
     }
+
   
   /* IP addresses - offset and format based on IPv4 or IPv6 */
-  if (is_ipv6)
+  switch (filter_type) {
+    case TUPLE_FILTER_IP6:
     {
       /* IPv6 source address (bytes 1-16) */
       u8 has_src_ip = 0;
       for (i = 0; i < 16; i++)
         {
-          if (filter->mask[i + 1])
+          if (filter->mask[i + IP6_SRC_IP_OFFSET])
             {
               has_src_ip = 1;
               break;
@@ -1450,16 +1476,16 @@ format_tuple_filter (u8 *s, va_list *args)
       if (has_src_ip)
         {
           ip6_address_t src_ip;
-          memcpy (&src_ip, filter->value +1, 16);
-          s = format (s, "  Source IP: %U", format_ip6_address, &src_ip);
+          memcpy (&src_ip, filter->value + IP6_SRC_IP_OFFSET, 16);
+          s = format (s, "       Src IP: %U", format_ip6_address, &src_ip);
           
           /* Check for prefix/mask and display it */
           u8 prefix_len = 128;
           for (i = 0; i < 16; i++)
             {
-              if (filter->mask[i + 1] != 0xFF)
+              if (filter->mask[i + IP6_SRC_IP_OFFSET] != 0xFF)
                 {
-                  if (filter->mask[i + 1] == 0)
+                  if (filter->mask[i + IP6_SRC_IP_OFFSET] == 0)
                     {
                       prefix_len = i * 8;
                       break;
@@ -1489,7 +1515,7 @@ format_tuple_filter (u8 *s, va_list *args)
       u8 has_dst_ip = 0;
       for (i = 0; i < 16; i++)
         {
-          if (filter->mask[i + 17])
+          if (filter->mask[i + IP6_DST_IP_OFFSET])
             {
               has_dst_ip = 1;
               break;
@@ -1499,16 +1525,16 @@ format_tuple_filter (u8 *s, va_list *args)
       if (has_dst_ip)
         {
           ip6_address_t dst_ip;
-          memcpy (&dst_ip, filter->value + 17, 16);
-          s = format (s, "  Dest IP: %U", format_ip6_address, &dst_ip);
+          memcpy (&dst_ip, filter->value + IP6_DST_IP_OFFSET, 16);
+          s = format (s, "       Dst IP: %U", format_ip6_address, &dst_ip);
           
           /* Check for prefix/mask and display it */
           u8 prefix_len = 128;
           for (i = 0; i < 16; i++)
             {
-              if (filter->mask[i + 17] != 0xFF)
+              if (filter->mask[i + IP6_DST_IP_OFFSET] != 0xFF)
                 {
-                  if (filter->mask[i + 17] == 0)
+                  if (filter->mask[i + IP6_DST_IP_OFFSET] == 0)
                     {
                       prefix_len = i * 8;
                       break;
@@ -1516,7 +1542,7 @@ format_tuple_filter (u8 *s, va_list *args)
                   else
                     {
                       /* Calculate bits in this byte */
-                      u8 mask = filter->mask[i + 17];
+                      u8 mask = filter->mask[i + IP6_DST_IP_OFFSET];
                       u8 bits = 0;
                       while (mask & 0x80)
                         {
@@ -1534,30 +1560,15 @@ format_tuple_filter (u8 *s, va_list *args)
           s = format (s, "\n");
         }
       
-      /* Ports */
-      if (filter->length >= 34 && (filter->mask[32] || filter->mask[33]))
-        {
-          u16 src_port;
-          memcpy (&src_port, filter->value + 32, 2);
-          src_port = clib_net_to_host_u16 (src_port);
-          s = format (s, "  Source Port: %d\n", src_port);
-        }
-      
-      if (filter->length >= 36 && (filter->mask[34] || filter->mask[35]))
-        {
-          u16 dst_port;
-          memcpy (&dst_port, filter->value + 34, 2);
-          dst_port = clib_net_to_host_u16 (dst_port);
-          s = format (s, "  Dest Port: %d\n", dst_port);
-        }
     }
-  else
+    break;
+  case TUPLE_FILTER_IP4:
     {
       /* IPv4 source address (bytes 1-4) */
       u8 has_src_ip = 0;
       for (i = 0; i < 4; i++)
         {
-          if (filter->mask[i + 1])
+          if (filter->mask[i + IP4_SRC_IP_OFFSET])
             {
               has_src_ip = 1;
               break;
@@ -1567,16 +1578,16 @@ format_tuple_filter (u8 *s, va_list *args)
       if (has_src_ip)
         {
           ip4_address_t src_ip;
-          memcpy (&src_ip, filter->value + 1, 4);
-          s = format (s, "  Source IP: %U", format_ip4_address, &src_ip);
+          memcpy (&src_ip, filter->value + IP4_SRC_IP_OFFSET, 4);
+          s = format (s, "      Src IP: %U", format_ip4_address, &src_ip);
           
           /* Check for prefix/mask and display it */
           u8 prefix_len = 32;
           for (i = 0; i < 4; i++)
             {
-              if (filter->mask[i + 1] != 0xFF)
+              if (filter->mask[i + IP4_SRC_IP_OFFSET] != 0xFF)
                 {
-                  if (filter->mask[i + 1] == 0)
+                  if (filter->mask[i + IP4_SRC_IP_OFFSET] == 0)
                     {
                       prefix_len = i * 8;
                       break;
@@ -1584,7 +1595,7 @@ format_tuple_filter (u8 *s, va_list *args)
                   else
                     {
                       /* Calculate bits in this byte */
-                      u8 mask = filter->mask[i + 1];
+                      u8 mask = filter->mask[i + IP4_SRC_IP_OFFSET];
                       u8 bits = 0;
                       while (mask & 0x80)
                         {
@@ -1606,7 +1617,7 @@ format_tuple_filter (u8 *s, va_list *args)
       u8 has_dst_ip = 0;
       for (i = 0; i < 4; i++)
         {
-          if (filter->mask[i + 5])
+          if (filter->mask[i + IP4_DST_IP_OFFSET])
             {
               has_dst_ip = 1;
               break;
@@ -1616,16 +1627,16 @@ format_tuple_filter (u8 *s, va_list *args)
       if (has_dst_ip)
         {
           ip4_address_t dst_ip;
-          memcpy (&dst_ip, filter->value + 5, 4);
-          s = format (s, "  Dest IP: %U", format_ip4_address, &dst_ip);
+          memcpy (&dst_ip, filter->value + IP4_DST_IP_OFFSET, 4);
+          s = format (s, "       Dst IP: %U", format_ip4_address, &dst_ip);
           
           /* Check for prefix/mask and display it */
           u8 prefix_len = 32;
           for (i = 0; i < 4; i++)
             {
-              if (filter->mask[i + 5] != 0xFF)
+              if (filter->mask[i + IP4_DST_IP_OFFSET] != 0xFF)
                 {
-                  if (filter->mask[i + 5] == 0)
+                  if (filter->mask[i + IP4_DST_IP_OFFSET] == 0)
                     {
                       prefix_len = i * 8;
                       break;
@@ -1633,7 +1644,7 @@ format_tuple_filter (u8 *s, va_list *args)
                   else
                     {
                       /* Calculate bits in this byte */
-                      u8 mask = filter->mask[i + 5];
+                      u8 mask = filter->mask[i + IP4_DST_IP_OFFSET];
                       u8 bits = 0;
                       while (mask & 0x80)
                         {
@@ -1650,22 +1661,43 @@ format_tuple_filter (u8 *s, va_list *args)
             s = format (s, "/%d", prefix_len);
           s = format (s, "\n");
         }
-      
+    }
+    break;
+  default:
+     /* no IP addresses */
+     break;
+  }
+
+  if (filter->length > proto_offset  && proto_offset && filter->mask[proto_offset])
+    {
+      u8 proto = filter->value[proto_offset];
+      s = format (s, "       Protocol: ");
+      if (proto == IP_PROTOCOL_TCP)
+        s = format (s, "TCP (6)\n");
+      else if (proto == IP_PROTOCOL_UDP)
+        s = format (s, "UDP (17)\n");
+      else if (proto == IP_PROTOCOL_ICMP)
+        s = format (s, "ICMP (1)\n");
+      else if (proto == IP_PROTOCOL_ICMP6)
+        s = format (s, "ICMPv6 (58)\n");
+      else
+        s = format (s, "0x%x (mask 0x%x)\n", proto, filter->mask[proto_offset]);
+
       /* Ports */
-      if (filter->length >= 10 && (filter->mask[8] || filter->mask[9]))
+      if (filter->length > src_port_offset+1 && (filter->mask[src_port_offset] || filter->mask[src_port_offset+1]))
         {
-          u16 src_port;
-          memcpy (&src_port, filter->value + 8, 2);
+          u16 src_port = 0;
+          memcpy (&src_port, filter->value + src_port_offset, 2);
           src_port = clib_net_to_host_u16 (src_port);
-          s = format (s, "  Source Port: %d\n", src_port);
+          s = format (s, "         Src Port(%d): %d\n", src_port_offset, src_port);
         }
       
-      if (filter->length >= 12 && (filter->mask[10] || filter->mask[11]))
+      if (filter->length > dst_port_offset+1 && (filter->mask[dst_port_offset] || filter->mask[dst_port_offset+1]))
         {
-          u16 dst_port;
-          memcpy (&dst_port, filter->value + 10, 2);
+          u16 dst_port = 0;
+          memcpy (&dst_port, filter->value + dst_port_offset, 2);
           dst_port = clib_net_to_host_u16 (dst_port);
-          s = format (s, "  Dest Port: %d\n", dst_port);
+          s = format (s, "         Dst Port(%d): %d\n", dst_port_offset, dst_port);
         }
     }
   
@@ -1822,6 +1854,8 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
   u8 is_global = 0;
   u32 filter_id = ~0;
   char * option_name = 0;
+  unformat_input_t sub_input;
+
   
   /* Get a line of input */
   if (!unformat_user (input, unformat_line_input, line_input))
@@ -1847,23 +1881,35 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
       else if (unformat (line_input, "vni %d", &filter.vni))
         filter.vni_present = 1;
       else if (unformat (line_input, "outer-ipv4 %U", 
-                        unformat_vlib_cli_sub_input, &create_ipv4_5tuple_filter, &filter.outer_tuple))
+                        unformat_vlib_cli_sub_input, &sub_input))
         {
+	  error = create_ipv4_5tuple_filter(&sub_input, &filter.outer_tuple);
+	  if (error)
+	  	goto done;
           filter.outer_tuple_present = 1;
         }
       else if (unformat (line_input, "outer-ipv6 %U", 
-                        unformat_vlib_cli_sub_input, &create_ipv6_5tuple_filter, &filter.outer_tuple))
+                        unformat_vlib_cli_sub_input, &sub_input))
         {
+	  error = create_ipv6_5tuple_filter(&sub_input, &filter.outer_tuple);
+	  if (error)
+	  	goto done;
           filter.outer_tuple_present = 1;
         }
       else if (unformat (line_input, "inner-ipv4 %U", 
-                        unformat_vlib_cli_sub_input, &create_ipv4_5tuple_filter, &filter.inner_tuple))
+                        unformat_vlib_cli_sub_input, &sub_input))
         {
+	  error = create_ipv4_5tuple_filter(&sub_input, &filter.inner_tuple);
+	  if (error)
+	  	goto done;
           filter.inner_tuple_present = 1;
         }
       else if (unformat (line_input, "inner-ipv6 %U", 
-                        unformat_vlib_cli_sub_input, &create_ipv6_5tuple_filter, &filter.inner_tuple))
+                        unformat_vlib_cli_sub_input, &sub_input))
         {
+	  error = create_ipv6_5tuple_filter(&sub_input, &filter.inner_tuple);
+	  if (error)
+	  	goto done;
           filter.inner_tuple_present = 1;
         }
       else if (unformat (line_input, "option %s", &option_name))
