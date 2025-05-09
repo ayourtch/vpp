@@ -617,10 +617,11 @@ get_inner_ip_header (const geneve_header_t *geneve_hdr, u32 geneve_header_len,
 }
 
 /* Filter and capture Geneve packets */
-VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
+static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
                        vlib_node_runtime_t *node,
-                       vlib_frame_t *frame)
+                       vlib_frame_t *frame, int is_output)
 {
+
   geneve_pcapng_main_t *gpm = &geneve_pcapng_main;
   u32 n_left_from, *from, *to_next;
   u32 n_left_to_next;
@@ -646,9 +647,9 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
       static u8 *if_name = 0;
       int i;
       // FIXME: retrieve the real interfaces
-      for (i=0; i<5; i++) {
+      for (i=0; i<5*2; i++) {
         vec_reset_length (if_name);
-        if_name = format (if_name, "vpp-if-%d%c", i, 0);
+        if_name = format (if_name, "vpp-if-%d-%s%c", i/2, i % 2 ? "out" : "in", 0);
         gpm->output.write_pcapng_idb (output_ctx, i, (char *)if_name);
       }
       
@@ -696,6 +697,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           b0 = vlib_get_buffer (vm, bi0);
           sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
 	  vnet_feature_next (&next0, b0);
+	  clib_warning("CAPTURE is_out: %d", is_output);
           
           /* Skip interfaces where capture is not enabled, 
              unless global filters are defined */
@@ -795,14 +797,9 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
           if (packet_captured)
             {
               /* Capture the matching packet */
-              u64 timestamp = vlib_time_now (vm) * 1000000000; /* ns */
+              u64 timestamp = vlib_time_now (vm) * 1000000; 
               u32 orig_len = vlib_buffer_length_in_chain (vm, b0);
               vlib_buffer_t *buf_iter = b0;
-              
-              /* Add interface description to PCAPng file if needed */
-              static u8 *if_name = 0;
-              vec_reset_length (if_name);
-              if_name = format (if_name, "vpp-if-%d%c", sw_if_index0, 0);
               
               /* Allocate a temporary buffer for the entire packet */
               u8 *packet_copy = 0;
@@ -822,7 +819,7 @@ VLIB_NODE_FN (geneve_pcapng_node) (vlib_main_t *vm,
                 }
               
               /* Write packet data to PCAPng file */
-              gpm->output.write_pcapng_epb (output_ctx, sw_if_index0, 
+              gpm->output.write_pcapng_epb (output_ctx, (sw_if_index0 << 1) | is_output, 
                                          timestamp, orig_len, 
                                          packet_copy, offset);
                                          
@@ -840,11 +837,27 @@ packet_done:
   return frame->n_vectors;
 }
 
-/* Node registration */
-vlib_node_registration_t geneve_pcapng_node;
+VLIB_NODE_FN (geneve_pcapng_node_out) (vlib_main_t *vm,
+                       vlib_node_runtime_t *node,
+                       vlib_frame_t *frame)
+{
+   return geneve_pcapng_node_common(vm, node, frame, 1);
+}
 
-VLIB_REGISTER_NODE (geneve_pcapng_node) = {
-  .name = "geneve-pcapng-capture",
+VLIB_NODE_FN (geneve_pcapng_node_in) (vlib_main_t *vm,
+                       vlib_node_runtime_t *node,
+                       vlib_frame_t *frame)
+{
+   return geneve_pcapng_node_common(vm, node, frame, 0);
+}
+
+
+/* Node registration */
+vlib_node_registration_t geneve_pcapng_node_out;
+vlib_node_registration_t geneve_pcapng_node_in;
+
+VLIB_REGISTER_NODE (geneve_pcapng_node_out) = {
+  .name = "geneve-pcapng-capture-out",
   .vector_size = sizeof (u32),
   .format_trace = 0,
   .type = VLIB_NODE_TYPE_INTERNAL,
@@ -856,9 +869,28 @@ VLIB_REGISTER_NODE (geneve_pcapng_node) = {
   },
 };
 
-VNET_FEATURE_INIT (geneve_pcapng_feature, static) = {
+VLIB_REGISTER_NODE (geneve_pcapng_node_in) = {
+  .name = "geneve-pcapng-capture-in",
+  .vector_size = sizeof (u32),
+  .format_trace = 0,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = 0,
+  // Specify next nodes if any
+  .n_next_nodes = 1,
+  .next_nodes = {
+    [0] = "error-drop",
+  },
+};
+
+VNET_FEATURE_INIT (geneve_pcapng_feature_out, static) = {
   .arc_name = "interface-output",
-  .node_name = "geneve-pcapng-capture",
+  .node_name = "geneve-pcapng-capture-out",
+  .runs_before = VNET_FEATURES ("interface-output-arc-end"),
+};
+
+VNET_FEATURE_INIT (geneve_pcapng_feature_in, static) = {
+  .arc_name = "device-input",
+  .node_name = "geneve-pcapng-capture-in",
   .runs_before = VNET_FEATURES ("interface-output-arc-end"),
 };
 
@@ -1330,13 +1362,17 @@ geneve_pcapng_enable_capture (u32 sw_if_index, u8 enable)
   if (enable)
     {
       /* Enable the feature on this interface */
-      vnet_feature_enable_disable ("interface-output", "geneve-pcapng-capture",
+      vnet_feature_enable_disable ("interface-output", "geneve-pcapng-capture-out",
+                                   sw_if_index, 1, 0, 0);
+      vnet_feature_enable_disable ("device-input", "geneve-pcapng-capture-in",
                                    sw_if_index, 1, 0, 0);
     }
   else
     {
       /* Disable the feature on this interface */
-      vnet_feature_enable_disable ("interface-output", "geneve-pcapng-capture",
+      vnet_feature_enable_disable ("interface-output", "geneve-pcapng-capture-out",
+                                   sw_if_index, 0, 0, 0);
+      vnet_feature_enable_disable ("device-input", "geneve-pcapng-capture-in",
                                    sw_if_index, 0, 0, 0);
     }
 
