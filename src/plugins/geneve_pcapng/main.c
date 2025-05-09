@@ -423,10 +423,17 @@ packet_matches_tuple_filter (const u8 *packet_data, u32 packet_len,
   for (i = 0; i < filter->length; i++)
     {
       if ((packet_data[i] & filter->mask[i]) != (filter->value[i] & filter->mask[i]))
-        return false;
+        goto no_match;
     }
     
   return true;
+no_match:
+  /*
+    clib_warning("pkt: %U", format_hexdump, packet_data, packet_len);
+    clib_warning("dat: %U", format_hexdump, filter->value, vec_len(filter->value));
+    clib_warning("msk: %U", format_hexdump, filter->mask, vec_len(filter->mask));
+  */
+  return false;
 }
 
 /* Check if packet matches a Geneve filter */
@@ -457,8 +464,9 @@ geneve_packet_matches_filter (geneve_pcapng_main_t *gpm,
     
   /* Check 5-tuple filters */
   if (filter->outer_tuple_present && 
-      !packet_matches_tuple_filter (outer_hdr, outer_len, &filter->outer_tuple))
+      !packet_matches_tuple_filter (outer_hdr, outer_len, &filter->outer_tuple)) {
     return false;
+  }
     
   if (filter->inner_tuple_present && 
       !packet_matches_tuple_filter (inner_hdr, inner_len, &filter->inner_tuple))
@@ -727,6 +735,7 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
                 
               /* UDP header follows IPv4 header */
               udp = (udp_header_t *)((u8 *)ip4 + outer_header_len);
+	      outer_header_len += sizeof(udp_header_t);
             }
           else if ((ip4->ip_version_and_header_length & 0xF0) == 0x60)
             {
@@ -742,6 +751,7 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
                 
               /* UDP header follows IPv6 header */
               udp = (udp_header_t *)(ip6 + 1);
+	      outer_header_len += sizeof(udp_header_t);
             }
           else
             {
