@@ -9,8 +9,10 @@ tokio = { version = "1", features = ["full", "fs", "io-util"] }
 futures-util = "0.3"
 bytes = "1.0"
 bytesize = "1.1"
-# TLS requirements
-rustls = "0.20"
-rustls-pemfile = "1.0"
-tokio-rustls = "0.23"
-hyper-rustls = { version = "0.23", features = ["http1"] }
+rustls = "0.20"                # TLS implementation in Rust
+rustls-pemfile = "1.0"         # PEM file parser
+hyper-rustls = "0.23"          # Hyper integration with rustls
+tokio-rustls = "0.23"          # Tokio integration with rustls
+# hyper-rustls = { version = "0.23", features = ["http1"] }
+# Optional HTTP/2 support
+h2 = "0.3"

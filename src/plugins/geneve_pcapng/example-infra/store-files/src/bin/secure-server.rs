@@ -4,33 +4,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use futures_util::StreamExt;
+// use std::net::SocketAddr;
+
+use futures_util::{StreamExt, TryStreamExt};
+use hyper::server::conn::Http;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::{Certificate, PrivateKey, ServerConfig};
-use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use rustls_pemfile;
+use std::io::BufReader;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 
 // Configuration struct with server settings
 struct Config {
     upload_dir: PathBuf,
     http_port: u16,
     https_port: u16,
-    max_file_size: usize,
-    concurrent_uploads: usize,
-    
+    max_file_size: usize,      // in bytes
+    concurrent_uploads: usize, // maximum number of concurrent uploads
+
     // TLS configuration
-    enable_https: bool,
-    cert_path: Option<PathBuf>,
-    key_path: Option<PathBuf>,
-    client_ca_path: Option<PathBuf>,
-    require_client_auth: bool,
+    tls_enabled: bool,
+    cert_file: Option<PathBuf>,
+    key_file: Option<PathBuf>,
+
+    // Client certificate authentication
+    client_auth_enabled: bool,
+    client_ca_file: Option<PathBuf>,
 }
 
 // Custom error type
@@ -38,8 +43,6 @@ enum UploadError {
     Io(io::Error),
     Hyper(hyper::Error),
     SizeLimitExceeded,
-    TooManyRequests,
-    TlsError(String),
 }
 
 impl From<io::Error> for UploadError {
@@ -65,25 +68,25 @@ async fn save_file(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    
-    // Open file for writing
+
+    // Open file for writing with appropriate buffer size
     let mut file = File::create(&path).await?;
-    
+
     // Track statistics
     let start = Instant::now();
     let mut total_bytes = 0;
     let mut last_log = Instant::now();
-    
+
     // Use proper hyper streaming with backpressure
-    let mut body_stream = body.into_data_stream();
-    
+    let mut body_stream = body.into_stream();
+
     // Process stream chunks efficiently
     while let Some(chunk_result) = body_stream.next().await {
         match chunk_result {
             Ok(chunk) => {
                 let chunk_size = chunk.len();
                 total_bytes += chunk_size;
-                
+
                 // Check size limit
                 if total_bytes > max_size {
                     // Close file and return error
@@ -91,16 +94,17 @@ async fn save_file(
                     let _ = tokio::fs::remove_file(&path).await;
                     return Err(UploadError::SizeLimitExceeded);
                 }
-                
+
                 // Write data using direct buffer access for better performance
                 file.write_all(&chunk).await?;
-                
+
                 // Apply gentle backpressure to prevent memory spikes
-                // Sleep a tiny amount after large chunks to let the system breathe  
-                if chunk_size > 1_048_576 {  // 1MB
+                // Sleep a tiny amount after large chunks to let the system breathe
+                if chunk_size > 1_048_576 {
+                    // 1MB
                     sleep(Duration::from_millis(1)).await;
                 }
-                
+
                 // Log progress periodically
                 let now = Instant::now();
                 if now.duration_since(last_log).as_secs() >= 1 {
@@ -110,16 +114,16 @@ async fn save_file(
                     } else {
                         0.0
                     };
-                    
+
                     println!(
-                        "Upload to {}: {:.2} MB, {:.2} MB/s", 
+                        "Upload to {}: {:.2} MB, {:.2} MB/s",
                         path.display(),
                         total_bytes as f64 / 1_048_576.0,
                         mb_per_sec
                     );
                     last_log = now;
                 }
-            },
+            }
             Err(e) => {
                 // Handle network errors gracefully
                 file.shutdown().await?;
@@ -128,25 +132,29 @@ async fn save_file(
             }
         }
     }
-    
+
     // Ensure all data is properly flushed to disk
     file.sync_all().await?;
-    
+
     // Log final statistics
     let elapsed = start.elapsed().as_secs_f64();
     if elapsed > 0.0 {
         let mb_per_sec = (total_bytes as f64 / elapsed) / 1_048_576.0;
         println!(
-            "Upload complete for {}: {:.2} MB in {:.2}s ({:.2} MB/s)", 
+            "Upload complete for {}: {:.2} MB in {:.2}s ({:.2} MB/s)",
             path.display(),
             total_bytes as f64 / 1_048_576.0,
             elapsed,
             mb_per_sec
         );
     }
-    
+
     Ok(total_bytes)
 }
+
+// Simple token to indicate client certificate was verified
+#[derive(Debug)]
+struct ClientCertVerifiedToken;
 
 // Main request handler
 async fn handle_request(
@@ -156,31 +164,21 @@ async fn handle_request(
 ) -> Result<Response<Body>, hyper::Error> {
     let method = req.method();
     let path = req.uri().path();
-    
-    // Get client certificate info if present
-    let client_cert_info = if let Some(conn_info) = req.extensions().get::<hyper_rustls::HttpsConnectorConnInfo>() {
-        match conn_info.peer_certificates() {
-            Some(certs) if !certs.is_empty() => {
-                // Extract client certificate details
-                // For demonstration, we'll just count the certs
-                format!("Client authenticated with {} certificate(s)", certs.len())
-            }
-            _ => "No client certificate provided".to_string(),
+
+    // Check client certificate authentication info if enabled
+    if config.client_auth_enabled {
+        // In a simpler implementation, we just check if a "client-cert-verified" token
+        // exists in the extensions, which we'll set during TLS acceptance
+        if !req.extensions().get::<ClientCertVerifiedToken>().is_some() {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("Client certificate required"))
+                .unwrap());
         }
-    } else {
-        "HTTP connection (no TLS)".to_string()
-    };
-    
-    // Log request details
-    println!("Request from {} to {} via {}",
-        req.headers().get("x-forwarded-for")
-            .and_then(|h| h.to_str().ok())
-            .or_else(|| req.headers().get("remote-addr").and_then(|h| h.to_str().ok()))
-            .unwrap_or("unknown"),
-        path,
-        client_cert_info
-    );
-    
+
+        println!("Request from authenticated client");
+    }
+
     match *method {
         Method::PUT => {
             // Check for content-length if present
@@ -190,15 +188,14 @@ async fn handle_request(
                         return Ok(Response::builder()
                             .status(StatusCode::PAYLOAD_TOO_LARGE)
                             .body(Body::from(format!(
-                                "File size {} bytes exceeds limit of {} bytes", 
-                                size, 
-                                config.max_file_size
+                                "File size {} bytes exceeds limit of {} bytes",
+                                size, config.max_file_size
                             )))
                             .unwrap());
                     }
                 }
             }
-            
+
             // Sanitize the path
             let safe_path = path.trim_start_matches('/');
             if safe_path.contains("..") || safe_path.is_empty() {
@@ -207,86 +204,73 @@ async fn handle_request(
                     .body(Body::from("Invalid path"))
                     .unwrap());
             }
-            
+
             let target_path = config.upload_dir.join(safe_path);
             println!("Receiving PUT request for: {}", target_path.display());
-            
+
             // Get a permit for this upload or return TooManyRequests
             let permit = match upload_semaphore.try_acquire() {
                 Ok(permit) => permit,
                 Err(_) => {
                     return Ok(Response::builder()
                         .status(StatusCode::TOO_MANY_REQUESTS)
-                        .body(Body::from("Server is handling too many uploads, please try again later"))
+                        .body(Body::from(
+                            "Server is handling too many uploads, please try again later",
+                        ))
                         .unwrap());
                 }
             };
-            
+
             match save_file(
                 req.into_body(),
                 target_path.clone(),
                 config.max_file_size,
                 permit,
-            ).await {
-                Ok(size) => {
-                    Ok(Response::builder()
-                        .status(StatusCode::CREATED)
-                        .header(hyper::header::CONTENT_TYPE, "text/plain")
-                        .body(Body::from(format!(
-                            "File uploaded successfully\nSize: {}\nPath: {}", 
-                            bytesize::to_string(size as u64, true),
-                            target_path.display()
-                        )))
-                        .unwrap())
-                },
+            )
+            .await
+            {
+                Ok(size) => Ok(Response::builder()
+                    .status(StatusCode::CREATED)
+                    .header(hyper::header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(format!(
+                        "File uploaded successfully\nSize: {}\nPath: {}",
+                        bytesize::to_string(size as u64, true),
+                        target_path.display()
+                    )))
+                    .unwrap()),
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&target_path).await;
-                    
+
                     match e {
-                        UploadError::SizeLimitExceeded => {
-                            Ok(Response::builder()
-                                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                                .body(Body::from(format!(
-                                    "File size exceeds maximum allowed size of {}", 
-                                    bytesize::to_string(config.max_file_size as u64, true)
-                                )))
-                                .unwrap())
-                        },
-                        UploadError::TooManyRequests => {
-                            Ok(Response::builder()
-                                .status(StatusCode::TOO_MANY_REQUESTS)
-                                .body(Body::from("Server is handling too many uploads"))
-                                .unwrap())
-                        },
+                        UploadError::SizeLimitExceeded => Ok(Response::builder()
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(Body::from(format!(
+                                "File size exceeds maximum allowed size of {}",
+                                bytesize::to_string(config.max_file_size as u64, true)
+                            )))
+                            .unwrap()),
                         UploadError::Io(err) => {
                             eprintln!("I/O error during upload: {}", err);
                             Ok(Response::builder()
                                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                                 .body(Body::from(format!("I/O Error: {}", err)))
                                 .unwrap())
-                        },
+                        }
                         UploadError::Hyper(err) => {
                             eprintln!("Network error during upload: {}", err);
                             Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
                                 .body(Body::from(format!("Network Error: {}", err)))
                                 .unwrap())
-                        },
-                        UploadError::TlsError(err) => {
-                            eprintln!("TLS error: {}", err);
-                            Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(Body::from(format!("TLS Error: {}", err)))
-                                .unwrap())
                         }
                     }
                 }
             }
-        },
+        }
         Method::HEAD => {
             let safe_path = path.trim_start_matches('/');
             let target_path = config.upload_dir.join(safe_path);
-            
+
             if target_path.exists() {
                 let metadata = match fs::metadata(&target_path) {
                     Ok(meta) => meta,
@@ -297,7 +281,7 @@ async fn handle_request(
                             .unwrap());
                     }
                 };
-                
+
                 Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(hyper::header::CONTENT_LENGTH, metadata.len().to_string())
@@ -309,239 +293,301 @@ async fn handle_request(
                     .body(Body::empty())
                     .unwrap())
             }
-        },
-        _ => {
-            Ok(Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(Body::from("Only PUT and HEAD methods are supported"))
-                .unwrap())
         }
+        _ => Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::from("Only PUT and HEAD methods are supported"))
+            .unwrap()),
     }
 }
 
-// Load certificates from file
-fn load_certs(path: &Path) -> io::Result<Vec<Certificate>> {
-    let cert_file = fs::File::open(path)?;
-    let mut reader = io::BufReader::new(cert_file);
-    
-    Ok(certs(&mut reader)?
-        .iter()
-        .map(|v| Certificate(v.clone()))
-        .collect())
+// Helper function to load certificates from a PEM file
+fn load_certificates(path: &Path) -> io::Result<Vec<Certificate>> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    let certs = rustls_pemfile::certs(&mut reader)?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+
+    Ok(certs)
 }
 
-// Load private key from file
+// Helper function to load a private key from a PEM file
 fn load_private_key(path: &Path) -> io::Result<PrivateKey> {
-    let key_file = fs::File::open(path)?;
-    let mut reader = io::BufReader::new(key_file);
-    
-    // Try PKCS8 format first
-    let keys = pkcs8_private_keys(&mut reader)?;
-    if !keys.is_empty() {
-        return Ok(PrivateKey(keys[0].clone()));
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    // Try to read a PKCS8 private key
+    let pkcs8_keys = rustls_pemfile::pkcs8_private_keys(&mut reader)?;
+    if !pkcs8_keys.is_empty() {
+        return Ok(PrivateKey(pkcs8_keys[0].clone()));
     }
-    
-    // If no PKCS8 keys found, try RSA format
-    reader = io::BufReader::new(fs::File::open(path)?);
-    let keys = rsa_private_keys(&mut reader)?;
-    if !keys.is_empty() {
-        return Ok(PrivateKey(keys[0].clone()));
+
+    // If that fails, try to read an RSA private key
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let rsa_keys = rustls_pemfile::rsa_private_keys(&mut reader)?;
+    if !rsa_keys.is_empty() {
+        return Ok(PrivateKey(rsa_keys[0].clone()));
     }
-    
-    Err(io::Error::new(io::ErrorKind::InvalidData, "No valid private key found"))
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "No valid private key found",
+    ))
 }
 
-// Create TLS config for the server
-fn create_tls_config(
-    cert_path: &Path,
-    key_path: &Path,
-    client_ca_path: Option<&Path>,
-    require_client_auth: bool,
-) -> Result<ServerConfig, UploadError> {
-    // Load server certificates
-    let certs = load_certs(cert_path)
-        .map_err(|e| UploadError::TlsError(format!("Failed to load certificate: {}", e)))?;
-    
-    // Load server private key
-    let key = load_private_key(key_path)
-        .map_err(|e| UploadError::TlsError(format!("Failed to load private key: {}", e)))?;
-    
-    // Start building server config
-    let mut config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth();
-    
-    // Add server certificate and key
-    config.set_single_cert(certs, key)
-        .map_err(|e| UploadError::TlsError(format!("TLS error: {}", e)))?;
-    
-    // Configure client certificate authentication if enabled
-    if let Some(ca_path) = client_ca_path {
-        let client_auth_roots = load_certs(ca_path)
-            .map_err(|e| UploadError::TlsError(format!("Failed to load client CA: {}", e)))?;
-        
-        // Create a client certificate verifier
-        let mut client_auth_config = rustls::server::AllowAnyAuthenticatedClient::new(rustls::RootCertStore::empty())
-            .into_owned();
-        
-        // Add CA certs to the verifier
-        for cert in client_auth_roots {
-            client_auth_config.client_auth_root_subjects.add(&cert);
-        }
-        
-        // Configure the server to require or request client certificates
-        if require_client_auth {
-            config.set_client_certificate_verifier(client_auth_config)
-                .map_err(|e| UploadError::TlsError(format!("TLS error: {}", e)))?;
-        } else {
-            // Optional client auth - not directly supported in rustls
-            // For now, we'll just use the same config but handle missing certs in the app
-            config.set_client_certificate_verifier(client_auth_config)
-                .map_err(|e| UploadError::TlsError(format!("TLS error: {}", e)))?;
-            println!("Warning: 'Optional' client auth mode is not fully supported by rustls. Clients without certificates may experience connection issues.");
-        }
+// Configure TLS with optional client certificate authentication
+fn configure_tls(config: &Config) -> io::Result<Option<ServerConfig>> {
+    if !config.tls_enabled {
+        return Ok(None);
     }
-    
-    Ok(config)
+
+    // Verify required TLS files exist
+    let cert_file = config.cert_file.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "TLS certificate file not specified",
+        )
+    })?;
+    let key_file = config
+        .key_file
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "TLS key file not specified"))?;
+
+    // Load server certificates and private key
+    let certs = load_certificates(cert_file)?;
+    let key = load_private_key(key_file)?;
+
+    // Configure TLS
+    let server_config = if config.client_auth_enabled {
+        if let Some(ca_file) = &config.client_ca_file {
+            let client_cas = load_certificates(ca_file)?;
+
+            // Create a root certificate store
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in &client_cas {
+                root_store.add(&cert).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to add CA cert: {:?}", e),
+                    )
+                })?;
+            }
+
+            // Create TLS configuration with client auth
+            let client_auth = rustls::server::AllowAnyAuthenticatedClient::new(root_store);
+            let mut server_config = rustls::ServerConfig::builder()
+                .with_safe_defaults()
+                .with_client_cert_verifier(client_auth)
+                .with_single_cert(certs, key)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+            // Enable ALPN (Application-Layer Protocol Negotiation) for HTTP/2 support
+            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            server_config
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Client authentication enabled but no CA file specified",
+            ));
+        }
+    } else {
+        // Create TLS configuration without client auth
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+        // Enable ALPN for HTTP/2 support
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        server_config
+    };
+
+    Ok(Some(server_config))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Configure the server
+    // Parse command line arguments or use defaults
+    // Here we're using hardcoded values, but you could use clap or similar to parse arguments
     let config = Arc::new(Config {
         upload_dir: PathBuf::from("./uploads"),
         http_port: 3000,
         https_port: 3443,
         max_file_size: 10 * 1024 * 1024 * 1024, // 10 GB
         concurrent_uploads: 5,                  // Allow 5 concurrent uploads
-        
-        // TLS configuration - change these for your setup
-        enable_https: true,
-        cert_path: Some(PathBuf::from("./certs/server.crt")),
-        key_path: Some(PathBuf::from("./certs/server.key")),
-        client_ca_path: Some(PathBuf::from("./certs/client-ca.crt")),
-        require_client_auth: false,             // Set to true to require client certs
+
+        // TLS configuration - set these to your actual paths
+        tls_enabled: true,
+        cert_file: Some(PathBuf::from("./certs/server.crt")),
+        key_file: Some(PathBuf::from("./certs/server.key")),
+
+        // Client certificate authentication
+        client_auth_enabled: false, // Set to true to enable client cert auth
+        client_ca_file: Some(PathBuf::from("./certs/ca.crt")),
     });
-    
+
     // Create upload directory
     fs::create_dir_all(&config.upload_dir)?;
-    
+
     // Create a semaphore to limit concurrent uploads
     let upload_semaphore = Arc::new(Semaphore::new(config.concurrent_uploads));
-    
+
     // Print server config
     println!("Starting high-performance file upload server");
     println!("Upload directory: {}", config.upload_dir.display());
-    println!("Maximum file size: {}", bytesize::to_string(config.max_file_size as u64, true));
+    println!(
+        "Maximum file size: {}",
+        bytesize::to_string(config.max_file_size as u64, true)
+    );
     println!("Concurrent uploads: {}", config.concurrent_uploads);
-    
-    // Start HTTP server
-    let http_config = config.clone();
-    let http_semaphore = upload_semaphore.clone();
-    let http_server = tokio::spawn(async move {
-        let http_addr = ([0, 0, 0, 0], http_config.http_port).into();
-        
-        println!("HTTP server starting on http://0.0.0.0:{}", http_config.http_port);
-        
-        let server = Server::bind(&http_addr)
-            .http1_keepalive(true)
-            .http1_half_close(true)
-            .tcp_nodelay(true)
-            .serve(make_service_fn(move |_| {
-                let config = http_config.clone();
-                let semaphore = http_semaphore.clone();
-                
-                async move {
-                    Ok::<_, hyper::Error>(service_fn(move |req| {
-                        handle_request(req, config.clone(), semaphore.clone())
-                    }))
-                }
-            }));
-        
-        if let Err(e) = server.await {
-            eprintln!("HTTP server error: {}", e);
-        }
-    });
-    
-    // Start HTTPS server if enabled
-    let https_handle = if config.enable_https {
-        if let (Some(cert_path), Some(key_path)) = (&config.cert_path, &config.key_path) {
-            // Create TLS configuration
-            let tls_config = match create_tls_config(
-                cert_path,
-                key_path,
-                config.client_ca_path.as_deref(),
-                config.require_client_auth,
-            ) {
-                Ok(config) => Arc::new(config),
-                Err(e) => {
-                    eprintln!("Failed to create TLS config: {:?}", e);
-                    return Err(format!("TLS configuration error").into());
-                }
-            };
-            
-            // Set up client authentication info
-            let client_auth_mode = if config.require_client_auth {
-                "required"
-            } else if config.client_ca_path.is_some() {
-                "optional"
-            } else {
-                "disabled"
-            };
-            
-            println!("HTTPS server starting on https://0.0.0.0:{}", config.https_port);
-            println!("Client certificate authentication: {}", client_auth_mode);
-            
-            let https_config = config.clone();
-            let https_semaphore = upload_semaphore.clone();
-            
-            // Build the HTTPS connector
-            let https_addr = ([0, 0, 0, 0], config.https_port).into();
-            
-            // Start the HTTPS server
-            let acceptor = TlsAcceptor::from(tls_config);
-            let tls_config_clone = tls_config.clone();
-            
-            let https_server = tokio::spawn(async move {
-                // Create a hyper server bound on the given address
-                let server = hyper::Server::bind(&https_addr).serve(make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
-                    let remote_addr = conn.remote_addr();
-                    let acceptor = acceptor.clone();
-                    let config = https_config.clone();
-                    let semaphore = https_semaphore.clone();
-                    
-                    async move {
-                        // Convert the TCP stream to a TLS stream
-                        Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
-                            // Add remote address to request headers for logging
-                            let mut req = req;
-                            let headers = req.headers_mut();
-                            headers.insert("remote-addr", remote_addr.to_string().parse().unwrap());
-                            
-                            handle_request(req, config.clone(), semaphore.clone())
-                        }))
-                    }
-                }));
-                
-                if let Err(e) = server.await {
-                    eprintln!("HTTPS server error: {}", e);
-                }
-            });
-            
-            Some(https_server)
-        } else {
-            eprintln!("HTTPS enabled but no cert or key path provided. HTTPS server not started.");
-            None
+
+    // Configure TLS if enabled
+    let tls_config = if config.tls_enabled {
+        println!("TLS enabled on port {}", config.https_port);
+        match configure_tls(&config) {
+            Ok(Some(cfg)) => Some(Arc::new(cfg)),
+            Ok(None) => {
+                println!("TLS disabled");
+                None
+            }
+            Err(e) => {
+                eprintln!("Error configuring TLS: {}", e);
+                return Err(e.into());
+            }
         }
     } else {
         None
     };
-    
-    // Wait for both servers (if https is enabled)
-    http_server.await?;
-    if let Some(https_handle) = https_handle {
-        https_handle.await?;
+
+    let config1 = config.clone();
+    let usem = upload_semaphore.clone();
+    let make_service = move |_: &hyper::server::conn::AddrStream| {
+        let config = config1.clone();
+        let semaphore = usem.clone();
+
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req| {
+                handle_request(req, config1.clone(), semaphore.clone())
+            }))
+        }
+    };
+
+    // Launch both HTTP and HTTPS servers if enabled
+    let mut handles = Vec::new();
+
+    // HTTP server
+    let http_addr = ([0, 0, 0, 0], config.http_port).into();
+
+    // Create HTTP server properly typed
+    let config1 = config.clone();
+    let usem = upload_semaphore.clone();
+    let http_server = Server::bind(&http_addr)
+        .http1_keepalive(true)
+        .tcp_nodelay(true)
+        .serve(make_service_fn(move |_conn: &_| {
+            let config1 = config1.clone();
+            let semaphore = usem.clone();
+
+            async move {
+                Ok::<_, hyper::Error>(service_fn(move |req| {
+                    handle_request(req, config1.clone(), semaphore.clone())
+                }))
+            }
+        }));
+
+    println!("HTTP server started on http://0.0.0.0:{}", config.http_port);
+
+    // Spawn HTTP server task
+    handles.push(tokio::spawn(async move {
+        if let Err(e) = http_server.await {
+            eprintln!("HTTP server error: {}", e);
+        }
+    }));
+
+    // HTTPS server (if configured)
+    if let Some(tls_config) = tls_config {
+        let tls_acceptor = TlsAcceptor::from(tls_config.clone());
+
+        // Create TCP listener for HTTPS
+        let tcp_listener =
+            tokio::net::TcpListener::bind(&format!("0.0.0.0:{}", config.https_port)).await?;
+        println!(
+            "HTTPS server started on https://0.0.0.0:{}",
+            config.https_port
+        );
+
+        // Spawn HTTPS server task
+        let config_clone = config.clone();
+        let semaphore_clone = upload_semaphore.clone();
+        let client_auth_enabled = config.client_auth_enabled;
+
+        handles.push(tokio::spawn(async move {
+            loop {
+                // Accept TLS connections
+                match tcp_listener.accept().await {
+                    Ok((tcp_stream, _)) => {
+                        let tls_acceptor = tls_acceptor.clone();
+                        let config = config_clone.clone();
+                        let semaphore = semaphore_clone.clone();
+
+                        // Spawn a task for each connection
+                        tokio::spawn(async move {
+                            // Establish TLS connection
+                            let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    eprintln!("TLS handshake error: {:?}", e);
+                                    return;
+                                }
+                            };
+
+                            // Extract client certificate info if needed
+                            let peer_certs_available = if client_auth_enabled {
+                                // Check if client provided certificates
+                                if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                                    !certs.is_empty()
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            // Create Hyper connection
+                            let mut http = Http::new();
+                            http.http1_keep_alive(true);
+
+                            // Create a service for this connection
+                            let service = service_fn(move |mut req: Request<Body>| {
+                                // Add client certificate info to request extensions if available
+                                if client_auth_enabled && peer_certs_available {
+                                    req.extensions_mut().insert(ClientCertVerifiedToken);
+                                }
+
+                                handle_request(req, config.clone(), semaphore.clone())
+                            });
+
+                            // Process HTTP requests over TLS
+                            if let Err(e) = http.serve_connection(tls_stream, service).await {
+                                eprintln!("HTTPS connection error: {:?}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("TCP accept error: {:?}", e);
+                    }
+                }
+            }
+        }));
     }
-    
+
+    // Wait for server tasks
+    futures_util::future::join_all(handles).await;
+
     Ok(())
 }

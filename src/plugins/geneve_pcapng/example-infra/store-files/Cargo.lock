@@ -604,6 +604,7 @@ dependencies = [
  "bytes",
  "bytesize",
  "futures-util",
+ "h2",
  "hyper",
  "hyper-rustls",
  "rustls",
