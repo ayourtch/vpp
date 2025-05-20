@@ -10,6 +10,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use hyper::server::conn::Http;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use rustls::client::ServerCertVerifier;
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile;
 use std::io::BufReader;
@@ -19,6 +20,209 @@ use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+
+use std::fmt;
+use std::time::SystemTime;
+
+use rustls::RootCertStore;
+use webpki::{DNSNameRef, EndEntityCert};
+use x509_parser::{certificate::X509Certificate, prelude::*};
+
+/// Represents a client's identity based on their TLS certificate
+#[derive(Clone)]
+pub struct ClientIdentity {
+    /// Raw certificate data (DER format)
+    certificate: Option<Vec<u8>>,
+
+    /// Common Name extracted from the certificate subject
+    common_name: Option<String>,
+
+    /// Whether a certificate was presented at all
+    certificate_presented: bool,
+
+    /// Whether the certificate is valid (signed by a trusted CA)
+    is_valid: bool,
+
+    /// Validation status message
+    validation_message: String,
+}
+
+impl ClientIdentity {
+    /// Create a new identity for a client that didn't present a certificate
+    pub fn new() -> Self {
+        Self {
+            certificate: None,
+            common_name: None,
+            certificate_presented: false,
+            is_valid: false,
+            validation_message: "No certificate provided".to_string(),
+        }
+    }
+
+    /// Create a new identity from a raw certificate (DER format)
+    pub fn with_certificate(cert_der: Vec<u8>) -> Self {
+        let mut identity = Self {
+            certificate: Some(cert_der.clone()),
+            common_name: None,
+            certificate_presented: true,
+            is_valid: false,
+            validation_message: "Certificate not yet validated".to_string(),
+        };
+
+        // Try to parse the certificate and extract information
+        match x509_parser::parse_x509_certificate(&cert_der) {
+            Ok((_, cert)) => {
+                // Extract the Common Name from the subject
+                if let Some(subject) = cert.subject().iter_common_name().next() {
+                    // if let Some(cn) = subject {
+                    identity.common_name = subject.as_str().ok().map(|s| s.to_string());
+                    // }
+                }
+            }
+            Err(e) => {
+                identity.validation_message = format!("Failed to parse certificate: {}", e);
+            }
+        }
+
+        identity
+    }
+
+    /// Validate the certificate against a set of CA certificates
+    pub fn validate(&mut self, ca_file_path: &Path) -> io::Result<bool> {
+        // If no certificate was presented, it's invalid
+        if !self.certificate_presented || self.certificate.is_none() {
+            self.is_valid = false;
+            self.validation_message = "No valid certificate presented".to_string();
+            return Ok(false);
+        }
+
+        // Get the certificate data
+        let cert_der = self.certificate.as_ref().unwrap();
+
+        // Load CA certificates
+        let root_store = match load_root_store(ca_file_path) {
+            Ok(store) => store,
+            Err(e) => {
+                self.is_valid = false;
+                self.validation_message = format!("Failed to load CA certificates: {}", e);
+                return Err(e);
+            }
+        };
+
+        // Validate the certificate
+        match validate_cert_against_roots(cert_der, &root_store) {
+            Ok(true) => {
+                self.is_valid = true;
+                self.validation_message = "Certificate validated successfully".to_string();
+                Ok(true)
+            }
+            Ok(false) => {
+                self.is_valid = false;
+                self.validation_message =
+                    "Certificate failed validation against trusted CAs".to_string();
+                Ok(false)
+            }
+            Err(e) => {
+                self.is_valid = false;
+                self.validation_message = format!("Validation error: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Check if a certificate was presented
+    pub fn has_certificate(&self) -> bool {
+        self.certificate_presented
+    }
+
+    /// Check if the certificate is valid (must call validate() first)
+    pub fn is_valid(&self) -> bool {
+        self.is_valid
+    }
+
+    /// Get the certificate's common name (if available)
+    pub fn common_name(&self) -> Option<&str> {
+        self.common_name.as_deref()
+    }
+
+    /// Get the validation status message
+    pub fn validation_message(&self) -> &str {
+        &self.validation_message
+    }
+
+    /// Get the raw certificate data (if available)
+    pub fn raw_certificate(&self) -> Option<&[u8]> {
+        self.certificate.as_deref()
+    }
+}
+
+impl fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientIdentity")
+            .field("common_name", &self.common_name)
+            .field("certificate_presented", &self.certificate_presented)
+            .field("is_valid", &self.is_valid)
+            .field("validation_message", &self.validation_message)
+            .finish()
+    }
+}
+
+/// Load a RootCertStore from a PEM file containing trusted CA certificates
+fn load_root_store(ca_path: &Path) -> io::Result<RootCertStore> {
+    // Read the CA file
+    let ca_data = fs::read(ca_path)?;
+
+    // Parse the PEM file into individual certificates
+    let ca_certs = match rustls_pemfile::certs(&mut ca_data.as_slice()) {
+        Ok(certs) => certs,
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse CA certificates: {}", e),
+            ));
+        }
+    };
+
+    if ca_certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No certificates found in CA file",
+        ));
+    }
+
+    // Create a new root store
+    let mut root_store = RootCertStore::empty();
+    let mut added = 0;
+
+    // Add each certificate to the store
+    for cert_der in ca_certs {
+        // Add the certificate to the store
+        match root_store.add(&Certificate(cert_der)) {
+            Ok(_) => {
+                added += 1;
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to add CA certificate: {}", e);
+                // Continue to try adding other certificates
+            }
+        }
+    }
+
+    if added == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Failed to add any CA certificates to trust store",
+        ));
+    }
+
+    Ok(root_store)
+}
+
+/// Validate a certificate against a store of trusted roots
+fn validate_cert_against_roots(cert_der: &[u8], root_store: &RootCertStore) -> io::Result<bool> {
+    // FIXME
+    Ok(false)
+}
 
 // Configuration struct with server settings
 struct Config {
