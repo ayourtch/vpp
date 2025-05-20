@@ -23,5 +23,6 @@ add_vpp_plugin(geneve_pcapng
   # API_TEST_SOURCES
   # LINK_LIBRARIES z
   # LINK_LIBRARIES isal
+  # isal requires "sudo apt-get install libisal-dev"
   LINK_LIBRARIES isal z
 )

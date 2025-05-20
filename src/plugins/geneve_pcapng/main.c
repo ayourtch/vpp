@@ -266,7 +266,10 @@ int pcapng_igzip_write_chunk(void *context, const void *chunk, size_t chunk_size
         
         // Write compressed output
      size_t bytes_compressed = CHUNK_SIZE - ctx->stream.avail_out;
-     write(ctx->fd, ctx->out_buf, bytes_compressed);
+     int result = write(ctx->fd, ctx->out_buf, bytes_compressed);
+     if (result != bytes_compressed) {
+        return -1;
+     }
         
         // Reset output buffer for next chunk
      ctx->stream.next_out = ctx->out_buf;
@@ -918,6 +921,27 @@ get_inner_ip_header (const geneve_header_t *geneve_hdr, u32 geneve_header_len,
   return inner_hdr;
 }
 
+typedef struct
+{
+  u32 sw_if_index;
+} pcapng_capture_trace_t;
+
+static u8 *
+format_pcapng_capture_trace (u8 *s, va_list *args)
+{
+  // int i;
+  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+  CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
+  pcapng_capture_trace_t *t = va_arg (*args, pcapng_capture_trace_t *);
+
+  // u32 indent = format_get_indent (s);
+
+  s = format (s, "PCAPNG: sw_if_index %d", t->sw_if_index);
+  return s;
+}
+
+
+
 /* Filter and capture Geneve packets */
 static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
                        vlib_node_runtime_t *node,
@@ -1131,12 +1155,16 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
               vec_free (packet_copy);
 	      n_captured += 1;
             }
-          
 packet_done:
+            if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) && (b0->flags & VLIB_BUFFER_IS_TRACED)))
+            {
+              pcapng_capture_trace_t *t =
+              vlib_add_trace (vm, node, b0, sizeof (*t));
+              t->sw_if_index = sw_if_index0;
+            }
           vlib_validate_buffer_enqueue_x1 (vm, node, next_index, to_next,
                                           n_left_to_next, bi0, next0);
         }
-        
       vlib_put_next_frame (vm, node, next_index, n_left_to_next);
     }
   if (n_captured) {
@@ -1168,7 +1196,7 @@ vlib_node_registration_t geneve_pcapng_node_in;
 VLIB_REGISTER_NODE (geneve_pcapng_node_out) = {
   .name = "geneve-pcapng-capture-out",
   .vector_size = sizeof (u32),
-  .format_trace = 0,
+  .format_trace = format_pcapng_capture_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
   .n_errors = 0,
   // Specify next nodes if any
@@ -1181,7 +1209,7 @@ VLIB_REGISTER_NODE (geneve_pcapng_node_out) = {
 VLIB_REGISTER_NODE (geneve_pcapng_node_in) = {
   .name = "geneve-pcapng-capture-in",
   .vector_size = sizeof (u32),
-  .format_trace = 0,
+  .format_trace = format_pcapng_capture_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
   .n_errors = 0,
   // Specify next nodes if any
