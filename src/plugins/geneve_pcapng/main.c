@@ -923,6 +923,7 @@ get_inner_ip_header (const geneve_header_t *geneve_hdr, u32 geneve_header_len,
 
 typedef struct
 {
+  u64 elapsed;
   u32 sw_if_index;
 } pcapng_capture_trace_t;
 
@@ -936,7 +937,7 @@ format_pcapng_capture_trace (u8 *s, va_list *args)
 
   // u32 indent = format_get_indent (s);
 
-  s = format (s, "PCAPNG: sw_if_index %d", t->sw_if_index);
+  s = format (s, "PCAPNG: sw_if_index %d elapsed %ld", t->sw_if_index, t->elapsed);
   return s;
 }
 
@@ -994,6 +995,7 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
       
       while (n_left_from > 0 && n_left_to_next > 0)
         {
+	  u64 packet_start = clib_cpu_time_now();
           vlib_buffer_t *b0;
           u32 bi0, sw_if_index0, next0 = 0;
           ip4_header_t *ip4;
@@ -1161,6 +1163,7 @@ packet_done:
               pcapng_capture_trace_t *t =
               vlib_add_trace (vm, node, b0, sizeof (*t));
               t->sw_if_index = sw_if_index0;
+	      t->elapsed = clib_cpu_time_now() - packet_start;
             }
           vlib_validate_buffer_enqueue_x1 (vm, node, next_index, to_next,
                                           n_left_to_next, bi0, next0);
@@ -1168,7 +1171,7 @@ packet_done:
       vlib_put_next_frame (vm, node, next_index, n_left_to_next);
     }
   if (n_captured) {
-      gpm->output.flush(output_ctx);
+      // gpm->output.flush(output_ctx);
   }
     
   return frame->n_vectors;
