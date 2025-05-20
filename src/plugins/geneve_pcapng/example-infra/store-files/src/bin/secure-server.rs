@@ -427,7 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         key_file: Some(PathBuf::from("./certs/server.key")),
 
         // Client certificate authentication
-        client_auth_enabled: false, // Set to true to enable client cert auth
+        client_auth_enabled: true, // false, // Set to true to enable client cert auth
         client_ca_file: Some(PathBuf::from("./certs/ca.crt")),
     });
 

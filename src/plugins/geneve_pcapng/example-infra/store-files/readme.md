@@ -61,3 +61,37 @@ wget --method=PUT \
      https://localhost:3443/path/to/save/file.dat# Upload with client certificate authentication
 
 
+
+--- cert v3
+
+
+# Create directory for certificates
+mkdir -p ./certs
+
+# Generate CA key and certificate (explicitly v3)
+openssl genrsa -out ./certs/ca.key 2048
+openssl req -x509 -new -nodes -key ./certs/ca.key -sha256 -days 1024 \
+    -out ./certs/ca.crt -subj "/CN=My Test CA" \
+    -extensions v3_ca -config <(echo -e "[req]\ndistinguished_name=req\n[req]\n[v3_ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=keyCertSign,cRLSign")
+
+# Generate server key and CSR
+openssl genrsa -out ./certs/server.key 2048
+openssl req -new -key ./certs/server.key -out ./certs/server.csr \
+    -subj "/CN=localhost"
+
+# Sign the server certificate with the CA (explicitly v3)
+openssl x509 -req -in ./certs/server.csr -CA ./certs/ca.crt -CAkey ./certs/ca.key \
+    -CAcreateserial -out ./certs/server.crt -days 365 -sha256 \
+    -extfile <(echo -e "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1")
+
+# Generate client key and CSR
+openssl genrsa -out ./certs/client.key 2048
+openssl req -new -key ./certs/client.key -out ./certs/client.csr \
+    -subj "/CN=testclient"
+
+# Sign the client certificate with the CA (explicitly v3)
+openssl x509 -req -in ./certs/client.csr -CA ./certs/ca.crt -CAkey ./certs/ca.key \
+    -CAcreateserial -out ./certs/client.crt -days 365 -sha256 \
+    -extfile <(echo -e "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth")
+
+
