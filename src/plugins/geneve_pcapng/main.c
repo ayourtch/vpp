@@ -24,6 +24,13 @@
 #include <vlib/unix/unix.h>
 #include <vppinfra/random.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+
 /* Define PCAPng format related constants */
 #define PCAPNG_BLOCK_TYPE_SHB        0x0A0D0D0A  /* Section Header Block */
 #define PCAPNG_BLOCK_TYPE_IDB        0x00000001  /* Interface Description Block */
@@ -137,9 +144,11 @@ struct geneve_capture_filter_t {
 struct geneve_output_t {
   void *(*init) (u32 worker_index);
   void (*cleanup) (void *ctx);
-  int (*write_pcapng_shb) (void *ctx);
-  int (*write_pcapng_idb) (void *ctx, u32 if_index, const char *if_name);
-  int (*write_pcapng_epb) (void *ctx, u32 if_index, u64 timestamp, 
+  int (*chunk_write) (void *ctx, const void *chunk, size_t chunk_size);
+  void (*flush) (void *context);
+  int (*write_pcapng_shb) (geneve_output_t *out, void *ctx);
+  int (*write_pcapng_idb) (geneve_output_t *out, void *ctx, u32 if_index, const char *if_name);
+  int (*write_pcapng_epb) (geneve_output_t *out, void *ctx, u32 if_index, u64 timestamp, 
                            u32 orig_len, void *packet_data, u32 packet_len);
   /* Can be extended with additional methods */
 };
@@ -149,6 +158,13 @@ typedef struct {
   FILE *file;
   char *filename;
 } file_output_ctx_t;
+
+typedef struct {
+    gzFile gz_file;
+    char *filename;
+    int fd;
+} gzfile_output_ctx_t;
+
 
 /* Plugin state */
 struct geneve_pcapng_main_t {
@@ -187,6 +203,116 @@ struct geneve_pcapng_main_t {
 /* Global plugin state */
 static geneve_pcapng_main_t geneve_pcapng_main;
 
+/*******
+ * GZ file utilities
+ ******/
+/**
+ * Initialize a new PCAPNG gzip writer
+ *
+ * @param filename The output filename to write to
+ * @return A pointer to the initialized writer or NULL on error
+ */
+void* pcapng_gzip_start(u32 worker_index) {
+    gzfile_output_ctx_t *ctx;
+    char filename[256];
+  
+  ctx = clib_mem_alloc_aligned (sizeof (gzfile_output_ctx_t), CLIB_CACHE_LINE_BYTES);
+  memset (ctx, 0, sizeof (*ctx));
+
+  /* Create a unique filename per worker */
+  snprintf (filename, sizeof (filename), "/tmp/geneve_capture_worker%u.pcapng.gz", worker_index);
+  ctx->filename = (void *)format (0, "%s%c", filename, 0);
+
+    if (!ctx) {
+        return NULL;
+    }
+
+    // Open the file with appropriate flags for syncing
+    int fd = open(ctx->filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        clib_mem_free(ctx);
+        return NULL;
+    }
+
+    // Open the gzip file with file descriptor
+    gzFile gz_file = gzdopen(fd, "wb");
+    if (!gz_file) {
+        close(fd);
+        clib_mem_free(ctx);
+        return NULL;
+    }
+
+    // Set buffer size to 0 to make gzwrite flush immediately
+    // This ensures file is always in a valid state
+    // gzbuffer(gz_file, 0);
+
+    ctx->gz_file = gz_file;
+    ctx->fd = fd;
+
+    return ctx;
+}
+
+/**
+ * Write a chunk of PCAPNG data to the gzipped file
+ *
+ * @param writer The writer to use
+ * @param chunk The chunk data to write
+ * @param chunk_size The size of the chunk in bytes
+ * @return 0 on success, -1 on error
+ */
+int pcapng_gzip_write_chunk(void *context, const void *chunk, size_t chunk_size) {
+    gzfile_output_ctx_t *writer = context;
+    if (!writer || !writer->gz_file) {
+        return -1;
+    }
+
+    // Write the chunk
+    int bytes_written = gzwrite(writer->gz_file, chunk, chunk_size);
+    if (bytes_written != chunk_size) {
+        return -1;
+    }
+    return 0;
+}
+
+static void
+pcapng_gzip_flush(void *context) {
+// Explicitly flush to ensure file is in a valid state
+
+/*
+    gzfile_output_ctx_t *writer = context;
+    if (gzflush(writer->gz_file, Z_SYNC_FLUSH) != Z_OK) {
+        return;
+    }
+
+    // Force a sync to disk
+    fsync(writer->fd);
+    */
+}
+
+/**
+ * Close the gzip writer and free resources
+ *
+ * @param writer The writer to close
+ * @return 0 on success, -1 on error
+ */
+static void pcapng_gzip_finish(void *context) {
+    gzfile_output_ctx_t *writer = context;
+    if (!writer) {
+        return;
+    }
+
+    // Close the gzip file (which also flushes)
+    if (gzclose(writer->gz_file) != Z_OK) {
+        clib_warning("Could not call gzclose");
+    }
+
+    // Free resources
+    clib_mem_free(writer->filename);
+    clib_mem_free(writer);
+
+    return;
+}
+
 /******************************************************************************
  * PCAPng file format utilities
  ******************************************************************************/
@@ -219,6 +345,25 @@ file_output_init (u32 worker_index)
   return ctx;
 }
 
+static int
+file_chunk_write (void *context, const void *chunk, size_t chunk_size)
+{
+  file_output_ctx_t *ctx = (file_output_ctx_t *) context;
+  if (!ctx->file) {
+      return -1;
+  }
+  int result = fwrite (chunk, 1, chunk_size, ctx->file) == chunk_size ? 0 : -1;
+  return result;
+}
+
+static void
+file_output_flush (void *context)
+{
+  file_output_ctx_t *ctx = (file_output_ctx_t *) context;
+  ASSERT(ctx->file);
+  fflush (ctx->file);  /* Ensure data is written to disk */
+}
+
 static void
 file_output_cleanup (void *context)
 {
@@ -237,9 +382,9 @@ file_output_cleanup (void *context)
 }
 
 static int
-file_write_pcapng_shb (void *context)
+file_write_pcapng_shb (geneve_output_t *out, void *context)
 {
-  file_output_ctx_t *ctx = (file_output_ctx_t *) context;
+  // file_output_ctx_t *ctx = (file_output_ctx_t *) context;
   struct {
     u32 block_type;
     u32 block_len;
@@ -250,7 +395,7 @@ file_write_pcapng_shb (void *context)
     u32 block_len_copy;
   } __attribute__ ((packed)) shb;
   
-  if (!ctx || !ctx->file)
+  if (!context)
     return -1;
     
   memset (&shb, 0, sizeof (shb));
@@ -262,18 +407,18 @@ file_write_pcapng_shb (void *context)
   shb.section_len = 0xFFFFFFFFFFFFFFFF;  /* Unknown length */
   shb.block_len_copy = sizeof (shb);
   
-  return fwrite (&shb, 1, sizeof (shb), ctx->file) == sizeof (shb) ? 0 : -1;
+  return out->chunk_write(context, &shb, sizeof (shb));
 }
 
 static int
-file_write_pcapng_idb (void *context, u32 if_index, const char *if_name)
+file_write_pcapng_idb (geneve_output_t *out, void *context, u32 if_index, const char *if_name)
 {
-  file_output_ctx_t *ctx = (file_output_ctx_t *) context;
+  // file_output_ctx_t *ctx = (file_output_ctx_t *) context;
   u32 name_len, pad_len, total_len;
   u8 *block;
   int result;
   
-  if (!ctx || !ctx->file)
+  if (!context)
     return -1;
     
   /* Calculate the padded name length (must be 32-bit aligned) */
@@ -307,22 +452,23 @@ file_write_pcapng_idb (void *context, u32 if_index, const char *if_name)
   *(u32 *)(block + total_len - 4) = total_len;
   
   /* Write the block to file */
-  result = fwrite (block, 1, total_len, ctx->file) == total_len ? 0 : -1;
+  // result = fwrite (block, 1, total_len, ctx->file) == total_len ? 0 : -1;
+  result = out->chunk_write(context, block, total_len);
   
   clib_mem_free (block);
   return result;
 }
 
 static int
-file_write_pcapng_epb (void *context, u32 if_index, u64 timestamp,
+file_write_pcapng_epb (geneve_output_t *out, void *context, u32 if_index, u64 timestamp,
                        u32 orig_len, void *packet_data, u32 packet_len)
 {
-  file_output_ctx_t *ctx = (file_output_ctx_t *) context;
+  // file_output_ctx_t *ctx = (file_output_ctx_t *) context;
   u32 pad_len, total_len;
   u8 *block;
   int result;
   
-  if (!ctx || !ctx->file)
+  if (!context)
     return -1;
     
   /* Calculate padding length (must be 32-bit aligned) */
@@ -354,10 +500,9 @@ file_write_pcapng_epb (void *context, u32 if_index, u64 timestamp,
   *(u32 *)(block + total_len - 4) = total_len;
   
   /* Write the block to file */
-  result = fwrite (block, 1, total_len, ctx->file) == total_len ? 0 : -1;
-  
-  if (result == 0)
-    fflush (ctx->file);  /* Ensure data is written to disk */
+  // result = fwrite (block, 1, total_len, ctx->file) == total_len ? 0 : -1;
+  result = out->chunk_write(context, block, total_len);
+
   
   clib_mem_free (block);
   return result;
@@ -636,6 +781,7 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
   u32 worker_index = vlib_get_thread_index ();
   void *output_ctx;
   u32 next_index;
+  u32 n_captured = 0;
   int i;
   
   /* Get output context for this worker */
@@ -651,14 +797,14 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
         }
         
       /* Write PCAPng header */
-      gpm->output.write_pcapng_shb (output_ctx);
+      gpm->output.write_pcapng_shb (&gpm->output, output_ctx);
       static u8 *if_name = 0;
       int i;
       // FIXME: retrieve the real interfaces
       for (i=0; i<5*2; i++) {
         vec_reset_length (if_name);
         if_name = format (if_name, "vpp-if-%d-%s%c", i/2, i % 2 ? "out" : "in", 0);
-        gpm->output.write_pcapng_idb (output_ctx, i, (char *)if_name);
+        gpm->output.write_pcapng_idb (&gpm->output, output_ctx, i, (char *)if_name);
       }
       
       /* Store the context */
@@ -705,7 +851,7 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
           b0 = vlib_get_buffer (vm, bi0);
           sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
 	  vnet_feature_next (&next0, b0);
-	  clib_warning("CAPTURE is_out: %d", is_output);
+	  // clib_warning("CAPTURE is_out: %d", is_output);
           
           /* Skip interfaces where capture is not enabled, 
              unless global filters are defined */
@@ -829,11 +975,12 @@ static_always_inline uword geneve_pcapng_node_common (vlib_main_t *vm,
                 }
               
               /* Write packet data to PCAPng file */
-              gpm->output.write_pcapng_epb (output_ctx, (sw_if_index0 << 1) | is_output, 
+              gpm->output.write_pcapng_epb (&gpm->output, output_ctx, (sw_if_index0 << 1) | is_output, 
                                          timestamp, orig_len, 
                                          packet_copy, offset);
                                          
               vec_free (packet_copy);
+	      n_captured += 1;
             }
           
 packet_done:
@@ -843,6 +990,9 @@ packet_done:
         
       vlib_put_next_frame (vm, node, next_index, n_left_to_next);
     }
+  if (n_captured) {
+      gpm->output.flush(output_ctx);
+  }
     
   return frame->n_vectors;
 }
@@ -2870,6 +3020,21 @@ geneve_pcapng_output_init (geneve_pcapng_main_t *gpm)
   /* Set up file output implementation */
   gpm->output.init = file_output_init;
   gpm->output.cleanup = file_output_cleanup;
+  gpm->output.chunk_write = file_chunk_write;
+  gpm->output.flush = file_output_flush;
+
+  gpm->output.init = pcapng_gzip_start;
+  gpm->output.cleanup = pcapng_gzip_finish;
+  gpm->output.chunk_write = pcapng_gzip_write_chunk;
+  gpm->output.flush = pcapng_gzip_flush;
+
+  // final result
+  gpm->output.init = pcapng_gzip_start;
+  gpm->output.cleanup = pcapng_gzip_finish;
+  gpm->output.chunk_write = pcapng_gzip_write_chunk;
+  gpm->output.flush = pcapng_gzip_flush;
+
+
   gpm->output.write_pcapng_shb = file_write_pcapng_shb;
   gpm->output.write_pcapng_idb = file_write_pcapng_idb;
   gpm->output.write_pcapng_epb = file_write_pcapng_epb;
