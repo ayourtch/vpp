@@ -1,0 +1,11 @@
+[package]
+name = "store-files"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hyper = { version = "0.14", features = ["full", "http1", "tcp"] }
+tokio = { version = "1", features = ["full", "fs", "io-util"] }
+futures-util = "0.3"
+bytes = "1.0"
+bytesize = "1.1"
