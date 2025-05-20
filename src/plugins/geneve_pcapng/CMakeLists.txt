@@ -21,5 +21,7 @@ add_vpp_plugin(geneve_pcapng
   # API_FILES
 
   # API_TEST_SOURCES
-  LINK_LIBRARIES z
+  # LINK_LIBRARIES z
+  # LINK_LIBRARIES isal
+  LINK_LIBRARIES isal z
 )
