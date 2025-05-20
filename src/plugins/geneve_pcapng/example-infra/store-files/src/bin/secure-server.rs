@@ -170,6 +170,7 @@ async fn handle_request(
         // In a simpler implementation, we just check if a "client-cert-verified" token
         // exists in the extensions, which we'll set during TLS acceptance
         if !req.extensions().get::<ClientCertVerifiedToken>().is_some() {
+            eprintln!("Unauthorized client");
             return Ok(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(Body::from("Client certificate required"))
@@ -364,6 +365,35 @@ fn configure_tls(config: &Config) -> io::Result<Option<ServerConfig>> {
     // Configure TLS
     let server_config = if config.client_auth_enabled {
         if let Some(ca_file) = &config.client_ca_file {
+            // Custom verifier that accepts any client certificate
+            struct AcceptAnyCertVerifier {}
+
+            impl rustls::server::ClientCertVerifier for AcceptAnyCertVerifier {
+                /*
+                        fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
+                            &[]
+                        }
+                */
+                fn client_auth_root_subjects(&self) -> Option<rustls::DistinguishedNames> {
+                    Some(vec![])
+                }
+
+                fn verify_client_cert(
+                    &self,
+                    end_entity: &rustls::Certificate,
+                    intermediates: &[rustls::Certificate],
+                    now: std::time::SystemTime,
+                ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
+                    // Accept any certificate, but capture it for later inspection
+                    eprintln!("Received client certificate: {} bytes", end_entity.0.len());
+                    eprintln!("Certificate: {:?}", &end_entity);
+                    Ok(rustls::server::ClientCertVerified::assertion())
+                }
+                fn client_auth_mandatory(&self) -> Option<bool> {
+                    Some(false) // This makes client certificates optional
+                }
+            }
+
             let client_cas = load_certificates(ca_file)?;
 
             // Create a root certificate store
@@ -377,11 +407,13 @@ fn configure_tls(config: &Config) -> io::Result<Option<ServerConfig>> {
                 })?;
             }
 
+            // Create a server config that requests client certificates
+            let verifier = Arc::new(AcceptAnyCertVerifier {});
             // Create TLS configuration with client auth
             let client_auth = rustls::server::AllowAnyAuthenticatedClient::new(root_store);
             let mut server_config = rustls::ServerConfig::builder()
                 .with_safe_defaults()
-                .with_client_cert_verifier(client_auth)
+                .with_client_cert_verifier(verifier)
                 .with_single_cert(certs, key)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
