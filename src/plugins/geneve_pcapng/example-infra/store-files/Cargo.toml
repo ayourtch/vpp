@@ -17,5 +17,7 @@ tokio-rustls = "0.23"          # Tokio integration with rustls
 # Optional HTTP/2 support
 h2 = "0.3"
 
-x509-parser = "0.15"
+x509-parser = "*" # 0.15
 webpki = "0.22"  # For certificate validation
+time = "0.3"  # For handling dates in x509-parser
+ring = "0.16"

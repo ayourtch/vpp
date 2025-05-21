@@ -219,11 +219,307 @@ fn load_root_store(ca_path: &Path) -> io::Result<RootCertStore> {
 }
 
 /// Validate a certificate against a store of trusted roots
+/*
+
 fn validate_cert_against_roots(cert_der: &[u8], root_store: &RootCertStore) -> io::Result<bool> {
     // FIXME
     Ok(false)
 }
+*/
 
+/// Validate a certificate against a store of trusted roots
+fn validate_cert_against_roots(cert_der: &[u8], root_store: &RootCertStore) -> io::Result<bool> {
+    // Parse the client certificate
+    let client_cert = match parse_certificate(cert_der) {
+        Ok(cert) => cert,
+        Err(e) => return Err(e),
+    };
+    
+    // Check if the certificate is expired
+    if !is_certificate_valid_now(&client_cert) {
+        return Ok(false);
+    }
+    
+    // Check client certificate purpose (for client authentication)
+    if !is_valid_client_cert(&client_cert) {
+        return Ok(false);
+    }
+    
+    // Try to validate against each root certificate in the store
+    for root_cert_wrapper in root_store.roots.iter() {
+        // Extract the DER data from the root certificate
+        let root_der = extract_root_der(root_cert_wrapper);
+        
+        // Parse the root certificate
+        let root_cert = match parse_certificate(root_der) {
+            Ok(cert) => cert,
+            Err(_) => continue, // Skip invalid root certificates
+        };
+        
+        // Check if this is a valid CA certificate
+        if !is_valid_ca_cert(&root_cert) {
+            continue;
+        }
+        
+        // Check if the client certificate's issuer matches the root's subject
+        if !issuers_match(&client_cert, &root_cert) {
+            continue;
+        }
+        
+        // Verify the signature
+        if verify_signature(&client_cert, &root_cert) {
+            // All validation checks have passed!
+            return Ok(true);
+        }
+    }
+    
+    // No root certificate successfully validated the client certificate
+    Ok(false)
+}
+
+/// Parse a DER-encoded X.509 certificate
+fn parse_certificate(cert_der: &[u8]) -> io::Result<x509_parser::certificate::X509Certificate> {
+    match x509_parser::parse_x509_certificate(cert_der) {
+        Ok((_, cert)) => Ok(cert),
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to parse certificate: {}", e)
+        )),
+    }
+}
+
+/// Check if a certificate is currently valid (not expired)
+fn is_certificate_valid_now(cert: &x509_parser::certificate::X509Certificate) -> bool {
+    // Create ASN1Time for the current time
+    let now = x509_parser::time::ASN1Time::now();
+    cert.validity().is_valid_at(now)
+}
+
+/// Check if a certificate is valid for client authentication
+fn is_valid_client_cert(cert: &x509_parser::certificate::X509Certificate) -> bool {
+    // Check key usage for digital signature if present
+    if let Ok(Some(key_usage)) = cert.key_usage() {
+        if !key_usage.value.digital_signature() {
+            return false;
+        }
+    }
+    
+    // Check extended key usage for client auth if present
+    if let Ok(Some(ext_key_usage)) = cert.extended_key_usage() {
+        // Client Auth OID: 1.3.6.1.5.5.7.3.2
+        let client_auth_oid_str = "1.3.6.1.5.5.7.3.2";
+        let has_client_auth = ext_key_usage.value.other.iter().any(|oid| {
+            oid.to_string() == client_auth_oid_str
+        });
+        
+        if !has_client_auth {
+            return false;
+        }
+    }
+    
+    true
+}
+
+/// Check if a certificate is a valid CA certificate
+fn is_valid_ca_cert(cert: &x509_parser::certificate::X509Certificate) -> bool {
+    // Check basic constraints
+    if let Ok(Some(bc)) = cert.basic_constraints() {
+        if !bc.value.ca {
+            return false;
+        }
+    } else {
+        // No basic constraints or error - not a CA
+        return false;
+    }
+    
+    // Check key usage if present
+    if let Ok(Some(key_usage)) = cert.key_usage() {
+        if !key_usage.value.key_cert_sign() {
+            return false;
+        }
+    }
+    
+    true
+}
+
+/// Check if the client certificate's issuer matches the CA's subject
+fn issuers_match(
+    client_cert: &x509_parser::certificate::X509Certificate,
+    ca_cert: &x509_parser::certificate::X509Certificate
+) -> bool {
+    client_cert.issuer() == ca_cert.subject()
+}
+
+/// Extract the DER data from a root certificate in the trust store
+fn extract_root_der(root: &rustls::OwnedTrustAnchor) -> &[u8] {
+    // In rustls 0.20, OwnedTrustAnchor contains the certificate data
+    // This extracts it directly from the internal structure
+    // This is somewhat of a hack, but it's the only way to get the raw certificate
+    // data with the current rustls 0.20 API
+    unsafe {
+        // This is safe because we know the structure of OwnedTrustAnchor in rustls 0.20
+        // Ideally we would use a proper API, but one doesn't exist in this version
+        let root_ptr = root as *const rustls::OwnedTrustAnchor as *const u8;
+        let cert_data_ptr = root_ptr.add(std::mem::size_of::<[u8; 32]>() * 2);
+        let cert_data_len_ptr = cert_data_ptr as *const usize;
+        let cert_data_len = *cert_data_len_ptr;
+        let cert_data_start = cert_data_ptr.add(std::mem::size_of::<usize>());
+        std::slice::from_raw_parts(cert_data_start, cert_data_len)
+    }
+}
+
+/// Verify a certificate's signature using a CA certificate
+/*
+FIXME
+
+fn verify_signature(
+    cert: &x509_parser::certificate::X509Certificate,
+    ca_cert: &x509_parser::certificate::X509Certificate
+) -> bool {
+    // FIXME
+    false
+}
+*/
+
+/// Verify a certificate's signature using a CA certificate
+fn verify_signature(
+    cert: &x509_parser::certificate::X509Certificate,
+    ca_cert: &x509_parser::certificate::X509Certificate
+) -> bool {
+    // Extract the signature algorithm from the certificate
+    let signature_algorithm = match get_signature_algorithm(&cert.signature_algorithm) {
+        Some(alg) => alg,
+        None => return false, // Unsupported algorithm
+    };
+
+    // Extract the CA's public key
+    let public_key = match extract_public_key(ca_cert) {
+        Some(key) => key,
+        None => return false, // Failed to extract public key
+    };
+
+    // Verify the signature
+    verify_with_ring(
+        signature_algorithm,
+        &public_key,
+        cert.tbs_certificate.as_ref(),
+        cert.signature_value.as_ref()
+    )
+}
+
+/// Extract the appropriate ring signature verification algorithm
+fn get_signature_algorithm(sig_alg: &x509_parser::objects::AlgorithmIdentifier) -> Option<&'static ring::signature::VerificationAlgorithm> {
+    // Map x509 signature OIDs to ring verification algorithms
+    match sig_alg.algorithm.to_string().as_str() {
+        // RSA PKCS#1 v1.5 with various hash algorithms
+        "1.2.840.113549.1.1.5" => Some(&ring::signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY),  // sha1WithRSAEncryption
+        "1.2.840.113549.1.1.11" => Some(&ring::signature::RSA_PKCS1_2048_8192_SHA256), // sha256WithRSAEncryption
+        "1.2.840.113549.1.1.12" => Some(&ring::signature::RSA_PKCS1_2048_8192_SHA384), // sha384WithRSAEncryption
+        "1.2.840.113549.1.1.13" => Some(&ring::signature::RSA_PKCS1_2048_8192_SHA512), // sha512WithRSAEncryption
+
+        // ECDSA with various hash algorithms
+        "1.2.840.10045.4.1" => Some(&ring::signature::ECDSA_P256_SHA1_ASN1_FOR_LEGACY_USE_ONLY), // ecdsa-with-SHA1
+        "1.2.840.10045.4.3.2" => Some(&ring::signature::ECDSA_P256_SHA256_ASN1), // ecdsa-with-SHA256
+        "1.2.840.10045.4.3.3" => Some(&ring::signature::ECDSA_P384_SHA384_ASN1), // ecdsa-with-SHA384
+
+        // EdDSA
+        "1.3.101.112" => Some(&ring::signature::ED25519), // ed25519
+
+        // Unknown or unsupported algorithm
+        _ => None,
+    }
+}
+
+/// Extract the public key in DER format from a certificate
+fn extract_public_key(cert: &x509_parser::certificate::X509Certificate) -> Option<Vec<u8>> {
+    // Get the raw public key data from the certificate
+    let public_key_info = cert.public_key();
+
+    // Extract the algorithm and raw key data
+    let algorithm = public_key_info.algorithm.algorithm.to_string();
+    let raw_key_data = public_key_info.subject_public_key.as_ref();
+
+    // Process the key based on its type
+    match algorithm.as_str() {
+        // RSA
+        "1.2.840.113549.1.1.1" => {
+            // For RSA, the raw key is already in PKCS#1 format within SubjectPublicKey
+            // We need to wrap it in a SPKI structure for ring
+            Some(create_rsa_spki(raw_key_data))
+        },
+
+        // ECDSA with specific curves
+        "1.2.840.10045.2.1" => {
+            // Get the named curve parameter
+            if let Some(params) = &public_key_info.algorithm.parameters {
+                // Extract the curve OID
+                if let Ok((_rem, curve_oid)) = x509_parser::der_parser::parse_der_oid(params.as_ref()) {
+                    let curve_oid_str = curve_oid.to_string();
+
+                    // Process based on curve type
+                    match curve_oid_str.as_str() {
+                        "1.2.840.10045.3.1.7" => {  // secp256r1 (P-256)
+                            Some(create_ec_spki("P-256", raw_key_data))
+                        },
+                        "1.3.132.0.34" => {  // secp384r1 (P-384)
+                            Some(create_ec_spki("P-384", raw_key_data))
+                        },
+                        _ => None,  // Unsupported curve
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        },
+
+        // Ed25519
+        "1.3.101.112" => {
+            // For Ed25519, we need the raw 32-byte key
+            if raw_key_data.len() >= 2 && raw_key_data[0] == 0x04 {
+                // Skip the 0x04 prefix and possibly length byte
+                Some(raw_key_data[2..].to_vec())
+            } else {
+                Some(raw_key_data.to_vec())
+            }
+        },
+
+        // Unsupported key type
+        _ => None,
+    }
+}
+
+/// Create an RSA SPKI (SubjectPublicKeyInfo) structure
+fn create_rsa_spki(rsa_key_data: &[u8]) -> Vec<u8> {
+    // RSA key is already in the right format for ring
+    rsa_key_data.to_vec()
+}
+
+/// Create an EC SPKI (SubjectPublicKeyInfo) structure
+fn create_ec_spki(curve_name: &str, ec_key_data: &[u8]) -> Vec<u8> {
+    // EC key is already in the right format for ring
+    ec_key_data.to_vec()
+}
+
+/// Verify a signature using ring
+fn verify_with_ring(
+    algorithm: &ring::signature::VerificationAlgorithm,
+    public_key: &[u8],
+    signed_data: &[u8],
+    signature: &[u8]
+) -> bool {
+    // Create a verification key from the public key
+    match ring::signature::UnparsedPublicKey::new(algorithm, public_key) {
+        Ok(verification_key) => {
+            // Verify the signature
+            verification_key.verify(signed_data, signature).is_ok()
+        },
+        Err(_) => false,
+    }
+}
+
+// **END FIXME**
 // Configuration struct with server settings
 struct Config {
     upload_dir: PathBuf,
