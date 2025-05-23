@@ -66,6 +66,8 @@ typedef struct geneve_option_filter_t geneve_option_filter_t;
 typedef struct geneve_tuple_filter_t geneve_tuple_filter_t;
 typedef struct geneve_output_t geneve_output_t;
 
+static geneve_pcapng_main_t *get_geneve_pcapng_main ();
+
 /* 
  * Option data types for GENEVE options
  */
@@ -366,13 +368,54 @@ static int http_pcapng_tx_callback (session_t *s);
 static void http_pcapng_session_disconnect_callback (session_t *s);
 static void http_pcapng_session_reset_callback (session_t *s);
 
+static int
+http_pcapng_accept_callback (session_t *s)
+{
+    return 0;
+}
+
 static session_cb_vft_t http_pcapng_session_cb_vft = {
+  .session_accept_callback = http_pcapng_accept_callback,
   .session_connected_callback = http_pcapng_session_connected_callback,
   .session_disconnect_callback = http_pcapng_session_disconnect_callback,
   .session_reset_callback = http_pcapng_session_reset_callback,
   .builtin_app_rx_callback = http_pcapng_rx_callback,
   .builtin_app_tx_callback = http_pcapng_tx_callback,
 };
+/*
+static int
+pcapng_http_connect_rpc (void *rpc_args)
+{
+  vnet_connect_args_t *a = rpc_args;
+  int rv;
+
+  rv = vnet_connect (a);
+  if (rv)
+    clib_warning (0, "connect returned: %U", format_session_error, rv);
+
+  session_endpoint_free_ext_cfgs (&a->sep_ext);
+  vec_free (a);
+  return rv;
+}
+
+static void
+pcapng_program_connect (vnet_connect_args_t *a)
+{
+  session_send_rpc_evt_to_thread_force (transport_cl_thread (),
+pcapng_http_connect_rpc, a);
+}
+*/
+
+static void
+enable_session_manager (vlib_main_t *vm)
+{
+    session_enable_disable_args_t args = { .is_en = 1,
+					   .rt_engine_type =
+					     RT_BACKEND_ENGINE_RULE_TABLE };
+    vlib_worker_thread_barrier_sync (vm);
+    vnet_session_enable_disable (vm, &args);
+    vlib_worker_thread_barrier_release (vm);
+}
 
 /**
  * Initialize HTTP streaming context for PCAPng capture
@@ -413,7 +456,8 @@ http_pcapng_init (u32 worker_index)
 			   vec_len (ctx->headers_buf));
 
     /* Set target URI */
-    ctx->target_uri = format (0, "/upload/file.pcapng%c", 0);
+    ctx->target_uri =
+      format (0, "http://172.17.1.1:3000/upload/file.pcapng%c", 0);
 
     /* Setup HTTP application attachment */
     clib_memset (&attach_args, 0, sizeof (attach_args));
@@ -424,6 +468,7 @@ http_pcapng_init (u32 worker_index)
     attach_args.session_cb_vft = &http_pcapng_session_cb_vft;
     attach_args.options = options;
     attach_args.options[APP_OPTIONS_SEGMENT_SIZE] = 32 << 20; /* 32MB */
+    attach_args.options[APP_OPTIONS_ADD_SEGMENT_SIZE] = 32 << 20; /* 32MB */
     attach_args.options[APP_OPTIONS_RX_FIFO_SIZE] = 8 << 10;  /* 8KB */
     attach_args.options[APP_OPTIONS_TX_FIFO_SIZE] = 32 << 10; /* 32KB */
     attach_args.options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN;
@@ -444,9 +489,9 @@ http_pcapng_init (u32 worker_index)
     ctx->app_index = attach_args.app_index;
     vec_free (attach_args.name);
 
-    /* Parse target endpoint - 192.0.0.1:80 */
     clib_memset (&ctx->connect_sep, 0, sizeof (ctx->connect_sep));
-    rv = parse_uri ("http://192.0.0.1/upload/file.pcapng", &ctx->connect_sep);
+    rv = parse_uri ("http://172.17.1.1:3000/upload/file.pcapng",
+		    &ctx->connect_sep);
     if (rv)
     {
 	clib_warning ("Failed to parse target URI: %U", format_session_error,
@@ -462,18 +507,30 @@ http_pcapng_init (u32 worker_index)
     }
 
     /* Initiate connection */
+    transport_endpt_ext_cfg_t *ext_cfg;
+    transport_endpt_cfg_http_t http_cfg = { (u32) 1000, 0 };
+
     vnet_connect_args_t connect_args;
     clib_memset (&connect_args, 0, sizeof (connect_args));
+    ext_cfg = session_endpoint_add_ext_cfg (
+      &connect_args.sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
+    clib_memcpy (ext_cfg->data, &http_cfg, sizeof (http_cfg));
+
     clib_memcpy (&connect_args.sep_ext, &ctx->connect_sep,
 		 sizeof (ctx->connect_sep));
     connect_args.app_index = ctx->app_index;
 
+    // FIXME: there must be a different way to pass the context, but this will
+    // do for now
+    connect_args.api_context = worker_index;
+
+    // pcapng_program_connect(&connect_args);
     rv = vnet_connect (&connect_args);
     if (rv)
     {
 	clib_warning ("HTTP PCAPng connect failed: %U", format_session_error,
 		      rv);
-	/* Cleanup and return NULL */
+	// Cleanup and return NULL
 	vnet_app_detach_args_t detach = { .app_index = ctx->app_index };
 	vnet_application_detach (&detach);
 	vec_free (ctx->headers_buf);
@@ -502,10 +559,12 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
     {
 	return -1;
     }
+    clib_warning ("are connected");
 
     /* Check if we need to send headers first */
     if (!ctx->headers_sent)
     {
+	clib_warning ("sending headers");
 	/* Setup HTTP POST headers */
 	ctx->msg.method_type = HTTP_REQ_POST;
 	ctx->msg.type = HTTP_MSG_REQUEST;
@@ -563,6 +622,7 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
 	/* Trigger TX event */
 	if (svm_fifo_set_event (ctx->session->tx_fifo))
 	  {
+	    clib_warning ("Trigger TX event");
 	    session_program_tx_io_evt (ctx->session->handle,
 				       SESSION_IO_EVT_TX);
 	  }
@@ -608,6 +668,7 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
 	/* Trigger TX event */
 	if (svm_fifo_set_event (ctx->session->tx_fifo))
 	  {
+	    clib_warning ("Trigger TX event body");
 	    session_program_tx_io_evt (ctx->session->handle,
 				       SESSION_IO_EVT_TX);
 	  }
@@ -693,86 +754,6 @@ http_pcapng_cleanup (void *context)
     clib_mem_free (ctx);
 }
 
-/* HTTP Client Session Callbacks */
-
-static int
-http_pcapng_session_connected_callback (u32 app_index, u32 session_index,
-					session_t *s, session_error_t err)
-{
-    http_pcapng_ctx_t *ctx = NULL;
-
-    if (err)
-    {
-	clib_warning ("HTTP PCAPng connection failed: %U",
-		      format_session_error, err);
-	return -1;
-    }
-
-    /* Find context by app_index - this is simplified, in real implementation
-     * you'd need a proper context lookup mechanism */
-    /* For now, store context in session opaque */
-    ctx =
-      (http_pcapng_ctx_t *) uword_to_pointer (s->opaque, http_pcapng_ctx_t *);
-    if (!ctx)
-    {
-	clib_warning ("No context found for HTTP PCAPng session");
-	return -1;
-    }
-
-    ctx->session = s;
-    ctx->connected = 1;
-
-    clib_warning ("HTTP PCAPng worker %u connected successfully",
-		  ctx->worker_index);
-    return 0;
-}
-
-static void
-http_pcapng_session_disconnect_callback (session_t *s)
-{
-    http_pcapng_ctx_t *ctx =
-      (http_pcapng_ctx_t *) uword_to_pointer (s->opaque, http_pcapng_ctx_t *);
-
-    if (ctx)
-    {
-	ctx->connected = 0;
-	ctx->session = NULL;
-	clib_warning ("HTTP PCAPng worker %u disconnected", ctx->worker_index);
-    }
-}
-
-static void
-http_pcapng_session_reset_callback (session_t *s)
-{
-    http_pcapng_session_disconnect_callback (s);
-}
-
-static int
-http_pcapng_rx_callback (session_t *s)
-{
-    /* For POST uploads, we typically don't expect much response data
-     * Just consume and log any response */
-    u32 max_deq = svm_fifo_max_dequeue_cons (s->rx_fifo);
-    if (max_deq > 0)
-    {
-	u8 *response_data = clib_mem_alloc (max_deq);
-	if (response_data)
-	  {
-	    svm_fifo_dequeue (s->rx_fifo, max_deq, response_data);
-	    clib_warning ("HTTP PCAPng received %u bytes response", max_deq);
-	    clib_mem_free (response_data);
-	  }
-    }
-    return 0;
-}
-
-static int
-http_pcapng_tx_callback (session_t *s)
-{
-    /* Handle any pending transmission if needed */
-    return 0;
-}
-
 /* Plugin state */
 struct geneve_pcapng_main_t {
   /* API message ID base */
@@ -809,6 +790,96 @@ struct geneve_pcapng_main_t {
 
 /* Global plugin state */
 static geneve_pcapng_main_t geneve_pcapng_main;
+
+static geneve_pcapng_main_t *
+get_geneve_pcapng_main ()
+{
+  return &geneve_pcapng_main;
+}
+
+/* HTTP Client Session Callbacks */
+
+static int
+http_pcapng_session_connected_callback (u32 app_index, u32 session_index,
+					session_t *s, session_error_t err)
+{
+  http_pcapng_ctx_t *ctx = NULL;
+
+  if (err)
+    {
+	clib_warning ("HTTP PCAPng connection failed: %U",
+		      format_session_error, err);
+	return -1;
+    }
+
+  /* Find context by app_index - this is simplified, in real implementation
+   * you'd need a proper context lookup mechanism */
+  /* For now, store context in session opaque */
+  /*
+  ctx =
+    (http_pcapng_ctx_t *) uword_to_pointer (s->opaque, http_pcapng_ctx_t *);
+  */
+  geneve_pcapng_main_t *gpm = get_geneve_pcapng_main ();
+  ctx = gpm->worker_output_ctx[s->opaque];
+  if (!ctx)
+    {
+	clib_warning ("No context found for HTTP PCAPng session");
+	return -1;
+    }
+
+  ctx->session = s;
+  ctx->connected = 1;
+
+  clib_warning ("HTTP PCAPng worker %u connected successfully",
+		ctx->worker_index);
+  return 0;
+}
+
+static void
+http_pcapng_session_disconnect_callback (session_t *s)
+{
+  http_pcapng_ctx_t *ctx =
+    (http_pcapng_ctx_t *) uword_to_pointer (s->opaque, http_pcapng_ctx_t *);
+
+  if (ctx)
+    {
+	ctx->connected = 0;
+	ctx->session = NULL;
+	clib_warning ("HTTP PCAPng worker %u disconnected", ctx->worker_index);
+    }
+}
+
+static void
+http_pcapng_session_reset_callback (session_t *s)
+{
+  http_pcapng_session_disconnect_callback (s);
+}
+
+static int
+http_pcapng_rx_callback (session_t *s)
+{
+  /* For POST uploads, we typically don't expect much response data
+   * Just consume and log any response */
+  u32 max_deq = svm_fifo_max_dequeue_cons (s->rx_fifo);
+  if (max_deq > 0)
+    {
+	u8 *response_data = clib_mem_alloc (max_deq);
+	if (response_data)
+	  {
+	    svm_fifo_dequeue (s->rx_fifo, max_deq, response_data);
+	    clib_warning ("HTTP PCAPng received %u bytes response", max_deq);
+	    clib_mem_free (response_data);
+	  }
+    }
+  return 0;
+}
+
+static int
+http_pcapng_tx_callback (session_t *s)
+{
+  /* Handle any pending transmission if needed */
+  return 0;
+}
 
 /*******
  * GZ file utilities
@@ -2686,8 +2757,8 @@ geneve_pcapng_filter_command_fn (vlib_main_t * vm,
   u32 filter_id = ~0;
   char * option_name = 0;
   unformat_input_t sub_input;
+  enable_session_manager (vm);
 
-  
   /* Get a line of input */
   if (!unformat_user (input, unformat_line_input, line_input))
     return clib_error_return (0, "expected arguments");
@@ -3674,6 +3745,11 @@ geneve_pcapng_output_init (geneve_pcapng_main_t *gpm)
   gpm->output.chunk_write = pcapng_igzip_write_chunk;
   gpm->output.flush = pcapng_igzip_flush;
 
+  // final result for http
+  gpm->output.init = http_pcapng_init;
+  gpm->output.flush = http_pcapng_flush;
+  gpm->output.chunk_write = http_pcapng_chunk_write;
+  gpm->output.cleanup = http_pcapng_cleanup;
 
   gpm->output.write_pcapng_shb = file_write_pcapng_shb;
   gpm->output.write_pcapng_idb = file_write_pcapng_idb;
