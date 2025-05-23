@@ -328,47 +328,50 @@ static void pcapng_igzip_finish(void *context) {
 #include <http/http.h>
 #include <http/http_content_types.h>
 
-typedef struct {
+typedef struct
+{
     /* HTTP client state */
     u32 app_index;
     session_t *session;
     u32 worker_index;
-    
+
     /* Streaming buffer management */
     u8 *send_buffer;
     u32 buffer_size;
     u32 bytes_pending;
-    
+
     /* HTTP request state */
     http_msg_t msg;
     u8 *headers_buf;
     http_headers_ctx_t req_headers;
     u8 *target_uri;
-    
+
     /* Connection state */
     u8 connected;
     u8 headers_sent;
     session_endpoint_cfg_t connect_sep;
-    
+
     /* Statistics */
     u64 total_bytes_sent;
     u64 chunks_sent;
 } http_pcapng_ctx_t;
 
 /* Forward declarations for HTTP client callbacks */
-static int http_pcapng_session_connected_callback(u32 app_index, u32 session_index, 
-                                                  session_t *s, session_error_t err);
-static int http_pcapng_rx_callback(session_t *s);
-static int http_pcapng_tx_callback(session_t *s);
-static void http_pcapng_session_disconnect_callback(session_t *s);
-static void http_pcapng_session_reset_callback(session_t *s);
+static int http_pcapng_session_connected_callback (u32 app_index,
+						   u32 session_index,
+						   session_t *s,
+						   session_error_t err);
+static int http_pcapng_rx_callback (session_t *s);
+static int http_pcapng_tx_callback (session_t *s);
+static void http_pcapng_session_disconnect_callback (session_t *s);
+static void http_pcapng_session_reset_callback (session_t *s);
 
 static session_cb_vft_t http_pcapng_session_cb_vft = {
-    .session_connected_callback = http_pcapng_session_connected_callback,
-    .session_disconnect_callback = http_pcapng_session_disconnect_callback,
-    .session_reset_callback = http_pcapng_session_reset_callback,
-    .builtin_app_rx_callback = http_pcapng_rx_callback,
-    .builtin_app_tx_callback = http_pcapng_tx_callback,
+  .session_connected_callback = http_pcapng_session_connected_callback,
+  .session_disconnect_callback = http_pcapng_session_disconnect_callback,
+  .session_reset_callback = http_pcapng_session_reset_callback,
+  .builtin_app_rx_callback = http_pcapng_rx_callback,
+  .builtin_app_tx_callback = http_pcapng_tx_callback,
 };
 
 /**
@@ -376,97 +379,110 @@ static session_cb_vft_t http_pcapng_session_cb_vft = {
  * @param worker_index Worker thread index
  * @return Initialized context or NULL on error
  */
-void* http_pcapng_init(u32 worker_index) {
+void *
+http_pcapng_init (u32 worker_index)
+{
     http_pcapng_ctx_t *ctx;
     vnet_app_attach_args_t attach_args;
     u64 options[18];
     int rv;
-    
+
     /* Allocate and initialize context */
-    ctx = clib_mem_alloc_aligned(sizeof(http_pcapng_ctx_t), CLIB_CACHE_LINE_BYTES);
-    if (!ctx) {
-        clib_warning("Failed to allocate HTTP PCAPng context");
-        return NULL;
+    ctx = clib_mem_alloc_aligned (sizeof (http_pcapng_ctx_t),
+				  CLIB_CACHE_LINE_BYTES);
+    if (!ctx)
+    {
+	clib_warning ("Failed to allocate HTTP PCAPng context");
+	return NULL;
     }
-    memset(ctx, 0, sizeof(*ctx));
-    
+    memset (ctx, 0, sizeof (*ctx));
+
     ctx->worker_index = worker_index;
     ctx->buffer_size = 64 * 1024; /* 64KB buffer */
-    ctx->send_buffer = clib_mem_alloc(ctx->buffer_size);
-    if (!ctx->send_buffer) {
-        clib_warning("Failed to allocate send buffer");
-        clib_mem_free(ctx);
-        return NULL;
+    ctx->send_buffer = clib_mem_alloc (ctx->buffer_size);
+    if (!ctx->send_buffer)
+    {
+	clib_warning ("Failed to allocate send buffer");
+	clib_mem_free (ctx);
+	return NULL;
     }
-    
+
     /* Initialize HTTP headers buffer */
-    vec_validate(ctx->headers_buf, 4095); /* 4KB for headers */
-    http_init_headers_ctx(&ctx->req_headers, ctx->headers_buf, vec_len(ctx->headers_buf));
-    
+    vec_validate (ctx->headers_buf, 4095); /* 4KB for headers */
+    http_init_headers_ctx (&ctx->req_headers, ctx->headers_buf,
+			   vec_len (ctx->headers_buf));
+
     /* Set target URI */
-    ctx->target_uri = format(0, "/upload/file.pcapng%c", 0);
-    
+    ctx->target_uri = format (0, "/upload/file.pcapng%c", 0);
+
     /* Setup HTTP application attachment */
-    clib_memset(&attach_args, 0, sizeof(attach_args));
-    clib_memset(options, 0, sizeof(options));
-    
+    clib_memset (&attach_args, 0, sizeof (attach_args));
+    clib_memset (options, 0, sizeof (options));
+
     attach_args.api_client_index = APP_INVALID_INDEX;
-    attach_args.name = format(0, "http_pcapng_worker_%u", worker_index);
+    attach_args.name = format (0, "http_pcapng_worker_%u", worker_index);
     attach_args.session_cb_vft = &http_pcapng_session_cb_vft;
     attach_args.options = options;
     attach_args.options[APP_OPTIONS_SEGMENT_SIZE] = 32 << 20; /* 32MB */
     attach_args.options[APP_OPTIONS_RX_FIFO_SIZE] = 8 << 10;  /* 8KB */
     attach_args.options[APP_OPTIONS_TX_FIFO_SIZE] = 32 << 10; /* 32KB */
     attach_args.options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN;
-    
-    rv = vnet_application_attach(&attach_args);
-    if (rv) {
-        clib_warning("HTTP PCAPng app attach failed: %U", format_session_error, rv);
-        vec_free(ctx->headers_buf);
-        vec_free(ctx->target_uri);
-        vec_free(attach_args.name);
-        clib_mem_free(ctx->send_buffer);
-        clib_mem_free(ctx);
-        return NULL;
+
+    rv = vnet_application_attach (&attach_args);
+    if (rv)
+    {
+	clib_warning ("HTTP PCAPng app attach failed: %U",
+		      format_session_error, rv);
+	vec_free (ctx->headers_buf);
+	vec_free (ctx->target_uri);
+	vec_free (attach_args.name);
+	clib_mem_free (ctx->send_buffer);
+	clib_mem_free (ctx);
+	return NULL;
     }
-    
+
     ctx->app_index = attach_args.app_index;
-    vec_free(attach_args.name);
-    
+    vec_free (attach_args.name);
+
     /* Parse target endpoint - 192.0.0.1:80 */
-    clib_memset(&ctx->connect_sep, 0, sizeof(ctx->connect_sep));
-    rv = parse_uri("http://192.0.0.1/upload/file.pcapng", &ctx->connect_sep);
-    if (rv) {
-        clib_warning("Failed to parse target URI: %U", format_session_error, rv);
-        /* Cleanup and return NULL */
-        vnet_app_detach_args_t detach = { .app_index = ctx->app_index };
-        vnet_application_detach(&detach);
-        vec_free(ctx->headers_buf);
-        vec_free(ctx->target_uri);
-        clib_mem_free(ctx->send_buffer);
-        clib_mem_free(ctx);
-        return NULL;
+    clib_memset (&ctx->connect_sep, 0, sizeof (ctx->connect_sep));
+    rv = parse_uri ("http://192.0.0.1/upload/file.pcapng", &ctx->connect_sep);
+    if (rv)
+    {
+	clib_warning ("Failed to parse target URI: %U", format_session_error,
+		      rv);
+	/* Cleanup and return NULL */
+	vnet_app_detach_args_t detach = { .app_index = ctx->app_index };
+	vnet_application_detach (&detach);
+	vec_free (ctx->headers_buf);
+	vec_free (ctx->target_uri);
+	clib_mem_free (ctx->send_buffer);
+	clib_mem_free (ctx);
+	return NULL;
     }
-    
+
     /* Initiate connection */
     vnet_connect_args_t connect_args;
-    clib_memset(&connect_args, 0, sizeof(connect_args));
-    clib_memcpy(&connect_args.sep_ext, &ctx->connect_sep, sizeof(ctx->connect_sep));
+    clib_memset (&connect_args, 0, sizeof (connect_args));
+    clib_memcpy (&connect_args.sep_ext, &ctx->connect_sep,
+		 sizeof (ctx->connect_sep));
     connect_args.app_index = ctx->app_index;
-    
-    rv = vnet_connect(&connect_args);
-    if (rv) {
-        clib_warning("HTTP PCAPng connect failed: %U", format_session_error, rv);
-        /* Cleanup and return NULL */
-        vnet_app_detach_args_t detach = { .app_index = ctx->app_index };
-        vnet_application_detach(&detach);
-        vec_free(ctx->headers_buf);
-        vec_free(ctx->target_uri);
-        clib_mem_free(ctx->send_buffer);
-        clib_mem_free(ctx);
-        return NULL;
+
+    rv = vnet_connect (&connect_args);
+    if (rv)
+    {
+	clib_warning ("HTTP PCAPng connect failed: %U", format_session_error,
+		      rv);
+	/* Cleanup and return NULL */
+	vnet_app_detach_args_t detach = { .app_index = ctx->app_index };
+	vnet_application_detach (&detach);
+	vec_free (ctx->headers_buf);
+	vec_free (ctx->target_uri);
+	clib_mem_free (ctx->send_buffer);
+	clib_mem_free (ctx);
+	return NULL;
     }
-    
+
     return ctx;
 }
 
@@ -477,100 +493,126 @@ void* http_pcapng_init(u32 worker_index) {
  * @param chunk_size Size of data chunk
  * @return 0 on success, -1 on error
  */
-int http_pcapng_chunk_write(void *context, const void *chunk, size_t chunk_size) {
-    http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *)context;
-    
-    if (!ctx || !ctx->connected) {
-        return -1;
+int
+http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
+{
+    http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *) context;
+
+    if (!ctx || !ctx->connected)
+    {
+	return -1;
     }
-    
+
     /* Check if we need to send headers first */
-    if (!ctx->headers_sent) {
-        /* Setup HTTP POST headers */
-        ctx->msg.method_type = HTTP_REQ_POST;
-        ctx->msg.type = HTTP_MSG_REQUEST;
-        ctx->msg.data.type = HTTP_MSG_DATA_INLINE;
-        
-        /* Add content type header */
-        http_add_header(&ctx->req_headers, HTTP_HEADER_CONTENT_TYPE, 
-                       "application/octet-stream", strlen("application/octet-stream"));
-        
-        /* Add transfer encoding chunked */
-        http_add_header(&ctx->req_headers, HTTP_HEADER_TRANSFER_ENCODING,
-                       "chunked", strlen("chunked"));
-        
-        /* Set message lengths */
-        ctx->msg.data.target_path_len = vec_len(ctx->target_uri) - 1; /* exclude null terminator */
-        ctx->msg.data.headers_len = ctx->req_headers.tail_offset;
-        ctx->msg.data.body_len = 0; /* Will be sent in chunks */
-        
-        ctx->msg.data.target_path_offset = 0;
-        ctx->msg.data.headers_offset = ctx->msg.data.target_path_len;
-        ctx->msg.data.body_offset = ctx->msg.data.headers_offset + ctx->msg.data.headers_len;
-        ctx->msg.data.len = ctx->msg.data.target_path_len + ctx->msg.data.headers_len;
-        
-        /* Send HTTP headers */
-        int rv = svm_fifo_enqueue(ctx->session->tx_fifo, sizeof(ctx->msg), (u8 *)&ctx->msg);
-        if (rv != sizeof(ctx->msg)) {
-            clib_warning("Failed to enqueue HTTP message header");
-            return -1;
-        }
-        
-        rv = svm_fifo_enqueue(ctx->session->tx_fifo, ctx->msg.data.target_path_len, ctx->target_uri);
-        if (rv != ctx->msg.data.target_path_len) {
-            clib_warning("Failed to enqueue target path");
-            return -1;
-        }
-        
-        rv = svm_fifo_enqueue(ctx->session->tx_fifo, ctx->req_headers.tail_offset, ctx->headers_buf);
-        if (rv != ctx->req_headers.tail_offset) {
-            clib_warning("Failed to enqueue headers");
-            return -1;
-        }
-        
-        ctx->headers_sent = 1;
-        
-        /* Trigger TX event */
-        if (svm_fifo_set_event(ctx->session->tx_fifo)) {
-            session_program_tx_io_evt(ctx->session->handle, SESSION_IO_EVT_TX);
-        }
+    if (!ctx->headers_sent)
+    {
+	/* Setup HTTP POST headers */
+	ctx->msg.method_type = HTTP_REQ_POST;
+	ctx->msg.type = HTTP_MSG_REQUEST;
+	ctx->msg.data.type = HTTP_MSG_DATA_INLINE;
+
+	/* Add content type header */
+	http_add_header (&ctx->req_headers, HTTP_HEADER_CONTENT_TYPE,
+			 "application/octet-stream",
+			 strlen ("application/octet-stream"));
+
+	/* Add transfer encoding chunked */
+	http_add_header (&ctx->req_headers, HTTP_HEADER_TRANSFER_ENCODING,
+			 "chunked", strlen ("chunked"));
+
+	/* Set message lengths */
+	ctx->msg.data.target_path_len =
+	  vec_len (ctx->target_uri) - 1; /* exclude null terminator */
+	ctx->msg.data.headers_len = ctx->req_headers.tail_offset;
+	ctx->msg.data.body_len = 0; /* Will be sent in chunks */
+
+	ctx->msg.data.target_path_offset = 0;
+	ctx->msg.data.headers_offset = ctx->msg.data.target_path_len;
+	ctx->msg.data.body_offset =
+	  ctx->msg.data.headers_offset + ctx->msg.data.headers_len;
+	ctx->msg.data.len =
+	  ctx->msg.data.target_path_len + ctx->msg.data.headers_len;
+
+	/* Send HTTP headers */
+	int rv = svm_fifo_enqueue (ctx->session->tx_fifo, sizeof (ctx->msg),
+				   (u8 *) &ctx->msg);
+	if (rv != sizeof (ctx->msg))
+	  {
+	    clib_warning ("Failed to enqueue HTTP message header");
+	    return -1;
+	  }
+
+	rv = svm_fifo_enqueue (ctx->session->tx_fifo,
+			       ctx->msg.data.target_path_len, ctx->target_uri);
+	if (rv != ctx->msg.data.target_path_len)
+	  {
+	    clib_warning ("Failed to enqueue target path");
+	    return -1;
+	  }
+
+	rv = svm_fifo_enqueue (ctx->session->tx_fifo,
+			       ctx->req_headers.tail_offset, ctx->headers_buf);
+	if (rv != ctx->req_headers.tail_offset)
+	  {
+	    clib_warning ("Failed to enqueue headers");
+	    return -1;
+	  }
+
+	ctx->headers_sent = 1;
+
+	/* Trigger TX event */
+	if (svm_fifo_set_event (ctx->session->tx_fifo))
+	  {
+	    session_program_tx_io_evt (ctx->session->handle,
+				       SESSION_IO_EVT_TX);
+	  }
     }
-    
+
     /* Send chunk in HTTP chunked encoding format */
     u8 chunk_header[32];
-    int header_len = snprintf((char *)chunk_header, sizeof(chunk_header), "%zx\r\n", chunk_size);
-    
+    int header_len = snprintf ((char *) chunk_header, sizeof (chunk_header),
+			       "%zx\r\n", chunk_size);
+
     /* Send chunk size header */
-    int rv = svm_fifo_enqueue(ctx->session->tx_fifo, header_len, chunk_header);
-    if (rv < header_len) {
-        ctx->bytes_pending += (header_len - rv);
-        return 0; /* Will retry later */
+    int rv =
+      svm_fifo_enqueue (ctx->session->tx_fifo, header_len, chunk_header);
+    if (rv < header_len)
+    {
+	ctx->bytes_pending += (header_len - rv);
+	return 0; /* Will retry later */
     }
-    
+
     /* Send chunk data */
-    u32 bytes_to_send = clib_min(chunk_size, svm_fifo_max_enqueue(ctx->session->tx_fifo) - 2);
-    if (bytes_to_send > 0) {
-        rv = svm_fifo_enqueue(ctx->session->tx_fifo, bytes_to_send, (u8 *)chunk);
-        if (rv < 0) {
-            return -1;
-        }
-        
-        /* Send chunk terminator CRLF */
-        rv = svm_fifo_enqueue(ctx->session->tx_fifo, 2, (u8 *)"\r\n");
-        if (rv < 2) {
-            /* Track partial sends for retry */
-            ctx->bytes_pending += (2 - rv);
-        }
-        
-        ctx->total_bytes_sent += bytes_to_send;
-        ctx->chunks_sent++;
-        
-        /* Trigger TX event */
-        if (svm_fifo_set_event(ctx->session->tx_fifo)) {
-            session_program_tx_io_evt(ctx->session->handle, SESSION_IO_EVT_TX);
-        }
+    u32 bytes_to_send =
+      clib_min (chunk_size, svm_fifo_max_enqueue (ctx->session->tx_fifo) - 2);
+    if (bytes_to_send > 0)
+    {
+	rv = svm_fifo_enqueue (ctx->session->tx_fifo, bytes_to_send,
+			       (u8 *) chunk);
+	if (rv < 0)
+	  {
+	    return -1;
+	  }
+
+	/* Send chunk terminator CRLF */
+	rv = svm_fifo_enqueue (ctx->session->tx_fifo, 2, (u8 *) "\r\n");
+	if (rv < 2)
+	  {
+	    /* Track partial sends for retry */
+	    ctx->bytes_pending += (2 - rv);
+	  }
+
+	ctx->total_bytes_sent += bytes_to_send;
+	ctx->chunks_sent++;
+
+	/* Trigger TX event */
+	if (svm_fifo_set_event (ctx->session->tx_fifo))
+	  {
+	    session_program_tx_io_evt (ctx->session->handle,
+				       SESSION_IO_EVT_TX);
+	  }
     }
-    
+
     return 0;
 }
 
@@ -578,135 +620,158 @@ int http_pcapng_chunk_write(void *context, const void *chunk, size_t chunk_size)
  * Flush any pending data in HTTP stream
  * @param context HTTP PCAPng context
  */
-void http_pcapng_flush(void *context) {
-    http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *)context;
-    
-    if (!ctx || !ctx->connected || !ctx->session) {
-        return;
+void
+http_pcapng_flush (void *context)
+{
+    http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *) context;
+
+    if (!ctx || !ctx->connected || !ctx->session)
+    {
+	return;
     }
-    
+
     /* Send end-of-chunks marker (0\r\n\r\n) */
     const char *end_marker = "0\r\n\r\n";
-    int rv = svm_fifo_enqueue(ctx->session->tx_fifo, 5, (u8 *)end_marker);
-    if (rv == 5) {
-        /* Trigger final TX event */
-        if (svm_fifo_set_event(ctx->session->tx_fifo)) {
-            session_program_tx_io_evt(ctx->session->handle, SESSION_IO_EVT_TX);
-        }
+    int rv = svm_fifo_enqueue (ctx->session->tx_fifo, 5, (u8 *) end_marker);
+    if (rv == 5)
+    {
+	/* Trigger final TX event */
+	if (svm_fifo_set_event (ctx->session->tx_fifo))
+	  {
+	    session_program_tx_io_evt (ctx->session->handle,
+				       SESSION_IO_EVT_TX);
+	  }
     }
-    
+
     /* Log statistics */
-    clib_warning("HTTP PCAPng worker %u: sent %lu bytes in %lu chunks", 
-                 ctx->worker_index, ctx->total_bytes_sent, ctx->chunks_sent);
+    clib_warning ("HTTP PCAPng worker %u: sent %lu bytes in %lu chunks",
+		  ctx->worker_index, ctx->total_bytes_sent, ctx->chunks_sent);
 }
 
 /**
  * Cleanup HTTP PCAPng context and close connection
  * @param context HTTP PCAPng context to cleanup
  */
-void http_pcapng_cleanup(void *context) {
-    http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *)context;
-    
-    if (!ctx) {
-        return;
+void
+http_pcapng_cleanup (void *context)
+{
+    http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *) context;
+
+    if (!ctx)
+    {
+	return;
     }
-    
+
     /* Disconnect session if connected */
-    if (ctx->session && ctx->connected) {
-        vnet_disconnect_args_t disconnect_args = { 
-            .handle = session_handle(ctx->session),
-            .app_index = ctx->app_index 
-        };
-        vnet_disconnect_session(&disconnect_args);
+    if (ctx->session && ctx->connected)
+    {
+	vnet_disconnect_args_t disconnect_args = {
+	  .handle = session_handle (ctx->session), .app_index = ctx->app_index
+	};
+	vnet_disconnect_session (&disconnect_args);
     }
-    
+
     /* Detach application */
-    if (ctx->app_index != APP_INVALID_INDEX) {
-        vnet_app_detach_args_t detach_args = { 
-            .app_index = ctx->app_index,
-            .api_client_index = APP_INVALID_INDEX
-        };
-        vnet_application_detach(&detach_args);
+    if (ctx->app_index != APP_INVALID_INDEX)
+    {
+	vnet_app_detach_args_t detach_args = { .app_index = ctx->app_index,
+					       .api_client_index =
+						 APP_INVALID_INDEX };
+	vnet_application_detach (&detach_args);
     }
-    
+
     /* Free allocated memory */
-    if (ctx->send_buffer) {
-        clib_mem_free(ctx->send_buffer);
+    if (ctx->send_buffer)
+    {
+	clib_mem_free (ctx->send_buffer);
     }
-    
-    vec_free(ctx->headers_buf);
-    vec_free(ctx->target_uri);
-    
+
+    vec_free (ctx->headers_buf);
+    vec_free (ctx->target_uri);
+
     /* Free context */
-    clib_mem_free(ctx);
+    clib_mem_free (ctx);
 }
 
 /* HTTP Client Session Callbacks */
 
-static int 
-http_pcapng_session_connected_callback(u32 app_index, u32 session_index, 
-                                       session_t *s, session_error_t err) {
+static int
+http_pcapng_session_connected_callback (u32 app_index, u32 session_index,
+					session_t *s, session_error_t err)
+{
     http_pcapng_ctx_t *ctx = NULL;
-    
-    if (err) {
-        clib_warning("HTTP PCAPng connection failed: %U", format_session_error, err);
-        return -1;
+
+    if (err)
+    {
+	clib_warning ("HTTP PCAPng connection failed: %U",
+		      format_session_error, err);
+	return -1;
     }
-    
+
     /* Find context by app_index - this is simplified, in real implementation
      * you'd need a proper context lookup mechanism */
     /* For now, store context in session opaque */
-    ctx = (http_pcapng_ctx_t *)uword_to_pointer(s->opaque, http_pcapng_ctx_t *);
-    if (!ctx) {
-        clib_warning("No context found for HTTP PCAPng session");
-        return -1;
+    ctx =
+      (http_pcapng_ctx_t *) uword_to_pointer (s->opaque, http_pcapng_ctx_t *);
+    if (!ctx)
+    {
+	clib_warning ("No context found for HTTP PCAPng session");
+	return -1;
     }
-    
+
     ctx->session = s;
     ctx->connected = 1;
-    
-    clib_warning("HTTP PCAPng worker %u connected successfully", ctx->worker_index);
+
+    clib_warning ("HTTP PCAPng worker %u connected successfully",
+		  ctx->worker_index);
     return 0;
 }
 
-static void 
-http_pcapng_session_disconnect_callback(session_t *s) {
-    http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *)uword_to_pointer(s->opaque, http_pcapng_ctx_t *);
-    
-    if (ctx) {
-        ctx->connected = 0;
-        ctx->session = NULL;
-        clib_warning("HTTP PCAPng worker %u disconnected", ctx->worker_index);
+static void
+http_pcapng_session_disconnect_callback (session_t *s)
+{
+    http_pcapng_ctx_t *ctx =
+      (http_pcapng_ctx_t *) uword_to_pointer (s->opaque, http_pcapng_ctx_t *);
+
+    if (ctx)
+    {
+	ctx->connected = 0;
+	ctx->session = NULL;
+	clib_warning ("HTTP PCAPng worker %u disconnected", ctx->worker_index);
     }
 }
 
-static void 
-http_pcapng_session_reset_callback(session_t *s) {
-    http_pcapng_session_disconnect_callback(s);
+static void
+http_pcapng_session_reset_callback (session_t *s)
+{
+    http_pcapng_session_disconnect_callback (s);
 }
 
-static int 
-http_pcapng_rx_callback(session_t *s) {
+static int
+http_pcapng_rx_callback (session_t *s)
+{
     /* For POST uploads, we typically don't expect much response data
      * Just consume and log any response */
-    u32 max_deq = svm_fifo_max_dequeue_cons(s->rx_fifo);
-    if (max_deq > 0) {
-        u8 *response_data = clib_mem_alloc(max_deq);
-        if (response_data) {
-            svm_fifo_dequeue(s->rx_fifo, max_deq, response_data);
-            clib_warning("HTTP PCAPng received %u bytes response", max_deq);
-            clib_mem_free(response_data);
-        }
+    u32 max_deq = svm_fifo_max_dequeue_cons (s->rx_fifo);
+    if (max_deq > 0)
+    {
+	u8 *response_data = clib_mem_alloc (max_deq);
+	if (response_data)
+	  {
+	    svm_fifo_dequeue (s->rx_fifo, max_deq, response_data);
+	    clib_warning ("HTTP PCAPng received %u bytes response", max_deq);
+	    clib_mem_free (response_data);
+	  }
     }
     return 0;
 }
 
-static int 
-http_pcapng_tx_callback(session_t *s) {
+static int
+http_pcapng_tx_callback (session_t *s)
+{
     /* Handle any pending transmission if needed */
     return 0;
 }
-
 
 /* Plugin state */
 struct geneve_pcapng_main_t {

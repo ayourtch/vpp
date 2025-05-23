@@ -133,7 +133,7 @@ async fn handle_request(
     let target_path = config.upload_dir.join(safe_path);
 
     match *method {
-        Method::PUT => {
+        Method::PUT | Method::POST => {
             println!("Receiving PUT request for: {}", safe_path);
 
             match save_file(
