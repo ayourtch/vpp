@@ -467,10 +467,11 @@ http_pcapng_init (u32 worker_index)
     attach_args.name = format (0, "http_pcapng_worker_%u", worker_index);
     attach_args.session_cb_vft = &http_pcapng_session_cb_vft;
     attach_args.options = options;
-    attach_args.options[APP_OPTIONS_SEGMENT_SIZE] = 32 << 20; /* 32MB */
+    attach_args.options[APP_OPTIONS_SEGMENT_SIZE] = 32 << 20;	  /* 32MB */
     attach_args.options[APP_OPTIONS_ADD_SEGMENT_SIZE] = 32 << 20; /* 32MB */
-    attach_args.options[APP_OPTIONS_RX_FIFO_SIZE] = 8 << 10;  /* 8KB */
-    attach_args.options[APP_OPTIONS_TX_FIFO_SIZE] = 32 << 10; /* 32KB */
+    attach_args.options[APP_OPTIONS_RX_FIFO_SIZE] = 8 << 10;	  /* 8KB */
+    attach_args.options[APP_OPTIONS_TX_FIFO_SIZE] =
+      256 << 10; /* 256KB for streaming */
     attach_args.options[APP_OPTIONS_FLAGS] = APP_OPTIONS_FLAGS_IS_BUILTIN;
 
     rv = vnet_application_attach (&attach_args);
@@ -508,7 +509,9 @@ http_pcapng_init (u32 worker_index)
 
     /* Initiate connection */
     transport_endpt_ext_cfg_t *ext_cfg;
-    transport_endpt_cfg_http_t http_cfg = { (u32) 1000, 0 };
+    transport_endpt_cfg_http_t http_cfg = {
+      (u32) 3600, 0
+    }; /* 1 hour timeout for streaming */
 
     vnet_connect_args_t connect_args;
     clib_memset (&connect_args, 0, sizeof (connect_args));
@@ -520,11 +523,8 @@ http_pcapng_init (u32 worker_index)
 		 sizeof (ctx->connect_sep));
     connect_args.app_index = ctx->app_index;
 
-    // FIXME: there must be a different way to pass the context, but this will
-    // do for now
     connect_args.api_context = worker_index;
 
-    // pcapng_program_connect(&connect_args);
     rv = vnet_connect (&connect_args);
     if (rv)
     {
@@ -559,31 +559,21 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
     {
 	return -1;
     }
-    clib_warning ("are connected");
 
     /* Check if we need to send headers first */
     if (!ctx->headers_sent)
     {
-	clib_warning ("sending headers");
-	/* Setup HTTP POST headers */
-	ctx->msg.method_type = HTTP_REQ_POST;
+	clib_warning ("sending streaming PUT request");
+
+	/* Setup HTTP PUT headers for streaming */
+	ctx->msg.method_type = HTTP_REQ_PUT;
 	ctx->msg.type = HTTP_MSG_REQUEST;
-	ctx->msg.data.type = HTTP_MSG_DATA_INLINE;
-
-	/* Add content type header */
-	http_add_header (&ctx->req_headers, HTTP_HEADER_CONTENT_TYPE,
-			 "application/octet-stream",
-			 strlen ("application/octet-stream"));
-
-	/* Add transfer encoding chunked */
-	http_add_header (&ctx->req_headers, HTTP_HEADER_TRANSFER_ENCODING,
-			 "chunked", strlen ("chunked"));
+	ctx->msg.data.type = HTTP_MSG_DATA_STREAMING;
 
 	/* Set message lengths */
-	ctx->msg.data.target_path_len =
-	  vec_len (ctx->target_uri) - 1; /* exclude null terminator */
+	ctx->msg.data.target_path_len = vec_len (ctx->target_uri) - 1;
 	ctx->msg.data.headers_len = ctx->req_headers.tail_offset;
-	ctx->msg.data.body_len = 0; /* Will be sent in chunks */
+	ctx->msg.data.body_len = ~0ULL; /* Unknown length for streaming */
 
 	ctx->msg.data.target_path_offset = 0;
 	ctx->msg.data.headers_offset = ctx->msg.data.target_path_len;
@@ -601,6 +591,7 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
 	    return -1;
 	  }
 
+	/* Send target path */
 	rv = svm_fifo_enqueue (ctx->session->tx_fifo,
 			       ctx->msg.data.target_path_len, ctx->target_uri);
 	if (rv != ctx->msg.data.target_path_len)
@@ -609,6 +600,7 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
 	    return -1;
 	  }
 
+	/* Send headers */
 	rv = svm_fifo_enqueue (ctx->session->tx_fifo,
 			       ctx->req_headers.tail_offset, ctx->headers_buf);
 	if (rv != ctx->req_headers.tail_offset)
@@ -622,56 +614,35 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
 	/* Trigger TX event */
 	if (svm_fifo_set_event (ctx->session->tx_fifo))
 	  {
-	    clib_warning ("Trigger TX event");
 	    session_program_tx_io_evt (ctx->session->handle,
 				       SESSION_IO_EVT_TX);
 	  }
     }
 
-    /* Send chunk in HTTP chunked encoding format */
-    u8 chunk_header[32];
-    int header_len = snprintf ((char *) chunk_header, sizeof (chunk_header),
-			       "%zx\r\n", chunk_size);
+    /* For streaming PUT, we just enqueue the raw data */
+    /* The HTTP layer will handle chunked encoding */
+    u32 max_enq = svm_fifo_max_enqueue (ctx->session->tx_fifo);
+    if (max_enq < chunk_size)
+    {
+	/* Not enough space, would need to buffer */
+	clib_warning ("tx fifo full, need %lu have %u", chunk_size, max_enq);
+	return -1;
+    }
 
-    /* Send chunk size header */
     int rv =
-      svm_fifo_enqueue (ctx->session->tx_fifo, header_len, chunk_header);
-    if (rv < header_len)
+      svm_fifo_enqueue (ctx->session->tx_fifo, chunk_size, (u8 *) chunk);
+    if (rv < 0)
     {
-	ctx->bytes_pending += (header_len - rv);
-	return 0; /* Will retry later */
+	return -1;
     }
 
-    /* Send chunk data */
-    u32 bytes_to_send =
-      clib_min (chunk_size, svm_fifo_max_enqueue (ctx->session->tx_fifo) - 2);
-    if (bytes_to_send > 0)
+    ctx->total_bytes_sent += rv;
+    ctx->chunks_sent++;
+
+    /* Trigger TX event */
+    if (svm_fifo_set_event (ctx->session->tx_fifo))
     {
-	rv = svm_fifo_enqueue (ctx->session->tx_fifo, bytes_to_send,
-			       (u8 *) chunk);
-	if (rv < 0)
-	  {
-	    return -1;
-	  }
-
-	/* Send chunk terminator CRLF */
-	rv = svm_fifo_enqueue (ctx->session->tx_fifo, 2, (u8 *) "\r\n");
-	if (rv < 2)
-	  {
-	    /* Track partial sends for retry */
-	    ctx->bytes_pending += (2 - rv);
-	  }
-
-	ctx->total_bytes_sent += bytes_to_send;
-	ctx->chunks_sent++;
-
-	/* Trigger TX event */
-	if (svm_fifo_set_event (ctx->session->tx_fifo))
-	  {
-	    clib_warning ("Trigger TX event body");
-	    session_program_tx_io_evt (ctx->session->handle,
-				       SESSION_IO_EVT_TX);
-	  }
+	session_program_tx_io_evt (ctx->session->handle, SESSION_IO_EVT_TX);
     }
 
     return 0;
@@ -691,22 +662,21 @@ http_pcapng_flush (void *context)
 	return;
     }
 
-    /* Send end-of-chunks marker (0\r\n\r\n) */
-    const char *end_marker = "0\r\n\r\n";
-    int rv = svm_fifo_enqueue (ctx->session->tx_fifo, 5, (u8 *) end_marker);
-    if (rv == 5)
-    {
-	/* Trigger final TX event */
-	if (svm_fifo_set_event (ctx->session->tx_fifo))
-	  {
-	    session_program_tx_io_evt (ctx->session->handle,
-				       SESSION_IO_EVT_TX);
-	  }
-    }
+    /* For streaming PUT, we need to close the connection to signal end of data
+     */
+    /* The HTTP layer will send the final 0-sized chunk */
 
     /* Log statistics */
     clib_warning ("HTTP PCAPng worker %u: sent %lu bytes in %lu chunks",
 		  ctx->worker_index, ctx->total_bytes_sent, ctx->chunks_sent);
+
+    /* Disconnect the session to signal end of streaming */
+    vnet_disconnect_args_t disconnect_args = { .handle =
+						 session_handle (ctx->session),
+					       .app_index = ctx->app_index };
+    vnet_disconnect_session (&disconnect_args);
+
+    ctx->connected = 0;
 }
 
 /**
