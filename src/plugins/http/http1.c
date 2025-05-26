@@ -1169,8 +1169,8 @@ http1_req_state_tunnel_rx (http_conn_t *hc, http_req_t *req,
 }
 
 static http_sm_result_t
-http1_req_state_ayxx_transport_io_more_data(http_conn_t *hc, http_req_t *req,
-			   transport_send_params_t *sp)
+http1_req_state_ayxx_transport_io_more_data (http_conn_t *hc, http_req_t *req,
+					     transport_send_params_t *sp)
 {
   u32 max_deq, max_enq, max_read, n_segs = 2;
   svm_fifo_seg_t segs[n_segs];
