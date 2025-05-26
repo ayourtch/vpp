@@ -123,12 +123,13 @@ async fn handle_request(
 
     // Sanitize the path to prevent directory traversal attacks
     let safe_path = path.trim_start_matches('/');
+    /*
     if safe_path.contains("/") {
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from("Path cannot contain '/'"))
             .unwrap());
-    }
+    }*/
 
     let target_path = config.upload_dir.join(safe_path);
 

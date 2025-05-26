@@ -457,7 +457,7 @@ http_pcapng_init (u32 worker_index)
 
     /* Set target URI */
     ctx->target_uri =
-      format (0, "http://172.17.1.1:3000/upload/file.pcapng%c", 0);
+      format (0, "/upload/file.pcapng%c", 0);
 
     /* Setup HTTP application attachment */
     clib_memset (&attach_args, 0, sizeof (attach_args));

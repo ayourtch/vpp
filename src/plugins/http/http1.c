@@ -1169,6 +1169,40 @@ http1_req_state_tunnel_rx (http_conn_t *hc, http_req_t *req,
 }
 
 static http_sm_result_t
+http1_req_state_ayxx_transport_io_more_data(http_conn_t *hc, http_req_t *req,
+			   transport_send_params_t *sp)
+{
+  u32 max_deq, max_enq, max_read, n_segs = 2;
+  svm_fifo_seg_t segs[n_segs];
+  int n_written = 0;
+
+  HTTP_DBG (1, "aytest received data from client");
+
+  max_deq = http_io_ts_max_read (hc);
+  if (PREDICT_FALSE (max_deq == 0))
+    {
+      HTTP_DBG (1, "max_deq == 0");
+      return HTTP_SM_STOP;
+    }
+  max_enq = http_io_as_max_write (req);
+  if (max_enq == 0)
+    {
+      HTTP_DBG (1, "app's rx fifo full");
+      http_io_as_want_deq_ntf (req);
+      return HTTP_SM_STOP;
+    }
+  max_read = clib_min (max_enq, max_deq);
+  http_io_ts_read_segs (hc, segs, &n_segs, max_read);
+  n_written = http_io_as_write_segs (req, segs, n_segs);
+  http_io_ts_drain (hc, n_written);
+  HTTP_DBG (1, "transfered %u bytes", n_written);
+  http_app_worker_rx_notify (req);
+  http_io_ts_after_read (hc, 0);
+
+  return HTTP_SM_STOP;
+}
+
+static http_sm_result_t
 http1_req_state_udp_tunnel_rx (http_conn_t *hc, http_req_t *req,
 			       transport_send_params_t *sp)
 {
@@ -1295,7 +1329,7 @@ http1_req_state_wait_app_reply (http_conn_t *hc, http_req_t *req,
 
   http_get_app_msg (req, &msg);
 
-  if (msg.data.type > HTTP_MSG_DATA_PTR)
+  if (msg.data.type > 1 + HTTP_MSG_DATA_PTR)
     {
       clib_warning ("no data");
       sc = HTTP_STATUS_INTERNAL_ERROR;
@@ -1409,7 +1443,7 @@ http1_req_state_wait_app_method (http_conn_t *hc, http_req_t *req,
 
   http_get_app_msg (req, &msg);
 
-  if (msg.data.type > HTTP_MSG_DATA_PTR)
+  if (msg.data.type > 1 + HTTP_MSG_DATA_PTR)
     {
       clib_warning ("no data");
       goto error;
@@ -1776,7 +1810,8 @@ static http_sm_handler rx_state_funcs[HTTP_REQ_N_STATES] = {
   http1_req_state_transport_io_more_data,
   http1_req_state_wait_transport_method,
   0, /* wait app reply */
-  0, /* app io more data */
+  // WAS: 0, /* app io more data */
+  http1_req_state_ayxx_transport_io_more_data,
   http1_req_state_tunnel_rx,
   http1_req_state_udp_tunnel_rx,
 };
