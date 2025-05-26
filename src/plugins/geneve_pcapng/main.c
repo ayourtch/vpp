@@ -350,6 +350,8 @@ typedef struct
 
     /* Connection state */
     u8 connected;
+    /* buffer to keep the data in until we are connected */
+    u8 *preconnect_buffer;
     u8 headers_sent;
     session_endpoint_cfg_t connect_sep;
 
@@ -456,8 +458,7 @@ http_pcapng_init (u32 worker_index)
 			   vec_len (ctx->headers_buf));
 
     /* Set target URI */
-    ctx->target_uri =
-      format (0, "/upload/file.pcapng%c", 0);
+    ctx->target_uri = format (0, "/upload/file.pcapng%c", 0);
 
     /* Setup HTTP application attachment */
     clib_memset (&attach_args, 0, sizeof (attach_args));
@@ -555,9 +556,16 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
 {
     http_pcapng_ctx_t *ctx = (http_pcapng_ctx_t *) context;
 
-    if (!ctx || !ctx->connected)
+    if (!ctx)
     {
 	return -1;
+    }
+    if (!ctx->connected)
+    {
+	void *chunk_target = 0;
+	vec_add2 (ctx->preconnect_buffer, chunk_target, chunk_size);
+	memcpy (chunk_target, chunk, chunk_size);
+	return 0;
     }
 
     /* Check if we need to send headers first */
@@ -617,6 +625,30 @@ http_pcapng_chunk_write (void *context, const void *chunk, size_t chunk_size)
 	    session_program_tx_io_evt (ctx->session->handle,
 				       SESSION_IO_EVT_TX);
 	  }
+    }
+
+    if (vec_len (ctx->preconnect_buffer) > 0)
+    {
+	u32 max_enq = svm_fifo_max_enqueue (ctx->session->tx_fifo);
+	if (max_enq < vec_len (ctx->preconnect_buffer))
+	  {
+	    /* Not enough space, would need to buffer */
+	    clib_warning ("tx fifo full, need %lu have %u",
+			  vec_len (ctx->preconnect_buffer), max_enq);
+	    return -1;
+	  }
+
+	int rv = svm_fifo_enqueue (ctx->session->tx_fifo,
+				   vec_len (ctx->preconnect_buffer),
+				   ctx->preconnect_buffer);
+	if (rv < 0)
+	  {
+	    return -1;
+	  }
+
+	ctx->total_bytes_sent += rv;
+	ctx->chunks_sent++;
+	vec_free (ctx->preconnect_buffer);
     }
 
     /* For streaming PUT, we just enqueue the raw data */
@@ -1042,7 +1074,7 @@ file_write_pcapng_shb (geneve_output_t *out, void *context)
     u64 section_len;
     u32 block_len_copy;
   } __attribute__ ((packed)) shb;
-  
+
   if (!context)
     return -1;
     
