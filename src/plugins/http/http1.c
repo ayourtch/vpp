@@ -1614,9 +1614,12 @@ http1_req_state_app_io_more_data (http_conn_t *hc, http_req_t *req,
   max_write = http_io_ts_max_write (hc, sp);
   if (is_streaming)
     {
-      // FIXME: was this AYXX seg = http_buffer_get_segs (hb, UINT_MAX,
-      // &n_segs);
-      seg = http_buffer_get_segs (hb, max_write, &n_segs);
+      /*
+       * do not drain more than we are going to write at a max - which
+       * is max_write minus 20 bytes to leave the room for chunk headers.
+       */
+
+      seg = http_buffer_get_segs (hb, max_write - 20, &n_segs);
       if (!seg)
 	{
 	  /* No data available right now, wait for more */
