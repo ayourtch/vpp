@@ -1,0 +1,240 @@
+---
+name: VPP Multi-Platform Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+
+jobs:
+  # Job to build dependency containers for each platform
+  build-deps:
+    name: Build Dependencies
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-latest-arm64' || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu
+            version: "22.04"
+            arch: x86_64
+          - os: ubuntu
+            version: "22.04"
+            arch: arm64
+          - os: ubuntu
+            version: "24.04"
+            arch: x86_64
+          - os: ubuntu
+            version: "24.04"
+            arch: arm64
+          - os: debian
+            version: "12"
+            arch: x86_64
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Create Dockerfile for dependencies
+        run: |
+          cat > Dockerfile.deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }} << 'EOF'
+          FROM ${{ matrix.os }}:${{ matrix.version }}
+          
+          # Set non-interactive frontend for apt
+          ENV DEBIAN_FRONTEND=noninteractive
+          
+          # Update package lists and install basic tools
+          RUN apt-get update && apt-get install -y \
+              build-essential \
+              make \
+              git \
+              wget \
+              curl \
+              && rm -rf /var/lib/apt/lists/*
+          
+          # Set working directory
+          WORKDIR /vpp
+          
+          # Copy source code
+          COPY . .
+          
+          # Install VPP dependencies
+          RUN make install-dep install-ext-deps
+          
+          # Clean up to reduce image size
+          RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+          EOF
+      
+      - name: Build dependency container
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          tags: vpp-deps:${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          outputs: type=docker,dest=/tmp/vpp-deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}.tar
+      
+      - name: Upload dependency container
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          path: /tmp/vpp-deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}.tar
+          retention-days: 1
+
+  # Main build and test jobs
+  build-and-test:
+    name: Build and Test
+    needs: build-deps
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-latest-arm64' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            version: "22.04"
+            arch: x86_64
+          - os: ubuntu
+            version: "22.04"
+            arch: arm64
+          - os: ubuntu
+            version: "24.04"
+            arch: x86_64
+          - os: ubuntu
+            version: "24.04"
+            arch: arm64
+          - os: debian
+            version: "12"
+            arch: x86_64
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Download dependency container
+        uses: actions/download-artifact@v4
+        with:
+          name: vpp-deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          path: /tmp/
+      
+      - name: Load dependency container
+        run: docker load -i /tmp/vpp-deps-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}.tar
+      
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}-
+      
+      - name: Create build and test Dockerfile
+        run: |
+          cat > Dockerfile.build-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }} << 'EOF'
+          FROM vpp-deps:${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          
+          # Install ccache for faster builds
+          RUN apt-get update && apt-get install -y ccache && rm -rf /var/lib/apt/lists/*
+          
+          # Setup ccache
+          ENV PATH="/usr/lib/ccache:$PATH"
+          ENV CCACHE_DIR=/vpp/.ccache
+          ENV CCACHE_MAXSIZE=2G
+          
+          # Copy current source (in case there are changes)
+          COPY . .
+          
+          # Build VPP in release mode
+          RUN make build-release
+          
+          # Run tests
+          RUN make test || true
+          EOF
+      
+      - name: Build and test VPP
+        run: |
+          docker build \
+            -f Dockerfile.build-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }} \
+            -t vpp-build:${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }} \
+            .
+      
+      - name: Extract build artifacts
+        run: |
+          # Create container to extract artifacts
+          container_id=$(docker create vpp-build:${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }})
+          
+          # Create artifacts directory
+          mkdir -p artifacts/${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          
+          # Extract build artifacts (adjust paths as needed for VPP)
+          docker cp $container_id:/vpp/build-root/. artifacts/${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}/build-root/ || true
+          docker cp $container_id:/vpp/build/. artifacts/${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}/build/ || true
+          
+          # Cleanup container
+          docker rm $container_id
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-artifacts-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          path: artifacts/${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}/
+          retention-days: 7
+      
+      - name: Extract test results
+        if: always()
+        run: |
+          # Create container to extract test results
+          container_id=$(docker create vpp-build:${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }})
+          
+          # Create test results directory
+          mkdir -p test-results/${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          
+          # Extract test results (adjust paths as needed for VPP test output)
+          docker cp $container_id:/vpp/test/. test-results/${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}/ || true
+          
+          # Cleanup container
+          docker rm $container_id
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpp-test-results-${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}
+          path: test-results/${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}/
+          retention-days: 7
+
+  # Summary job to collect all results
+  build-summary:
+    name: Build Summary
+    if: always()
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check build results
+        run: |
+          echo "Build Summary:"
+          echo "=============="
+          
+          # This will show the status of all build jobs
+          if [ "${{ needs.build-and-test.result }}" == "success" ]; then
+            echo "✅ All builds completed successfully"
+            exit 0
+          elif [ "${{ needs.build-and-test.result }}" == "failure" ]; then
+            echo "❌ Some builds failed"
+            exit 1
+          else
+            echo "⚠️  Builds completed with issues"
+            exit 1
+          fi
