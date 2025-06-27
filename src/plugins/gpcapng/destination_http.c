@@ -612,7 +612,11 @@ http_pcapng_session_connected_callback (u32 app_index, u32 session_index,
     ctx->retry_pending = 0;
     ctx->retry_count = 0;
     ctx->current_timeout = ctx->initial_timeout;
-    
+
+    /* Reset HTTP state for new connection */
+    ctx->headers_sent = 0;
+    ctx->preconnect_offset = 0;
+
     ctx->session = s;
     ctx->connected = 1;
     wdi_set_ready_flag(s->opaque, 1);
