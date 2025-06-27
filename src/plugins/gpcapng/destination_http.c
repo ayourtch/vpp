@@ -588,20 +588,18 @@ static int
 http_pcapng_session_connected_callback (u32 app_index, u32 session_index,
 					session_t *s, session_error_t err)
 {
-    
     if (err) {
-	clib_warning ("HTTP PCAPng connection failed: %U, FIXME: figure how to schedule callback",
+	  clib_warning ("HTTP PCAPng connection failed: %U, retrying...",
 -                     format_session_error, err);
-        return -1;
+          // session_index here is actually api_context when err != 0
+          worker_dest_index_t wdi = (worker_dest_index_t)session_index;
+          http_pcapng_ctx_t *ctx = wdi_to_worker_context(wdi);
 
-        // FIXME: s is zero; the below gets an invalid session... what to do ? 
-        s = session_get (session_index, vlib_get_thread_index());
-        http_pcapng_ctx_t *ctx = wdi_to_worker_context(s->opaque);
-        if (ctx) {
-            schedule_retry(s->opaque, ctx);
-        }
-        return -1;
-    }
+          if (ctx) {
+              schedule_retry(wdi, ctx);
+          }
+          return -1;
+      }
 
     http_pcapng_ctx_t *ctx = wdi_to_worker_context(s->opaque);
     
