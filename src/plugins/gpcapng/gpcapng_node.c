@@ -275,6 +275,9 @@ get_inner_ip_header (const geneve_header_t *geneve_hdr, u32 geneve_header_len,
   return inner_hdr;
 }
 
+extern void
+process_http_gpcapng_retries(u16 worker_index);
+
 /* Filter and capture Geneve packets */
 static_always_inline uword gpcapng_node_common (vlib_main_t *vm,
                        vlib_node_runtime_t *node,
@@ -484,6 +487,9 @@ packet_done:
 
   vlib_node_increment_counter (vm, node->node_index, PCAPNG_CAPTURE_ERROR_MATCHED, n_matched);
   vlib_node_increment_counter (vm, node->node_index, PCAPNG_CAPTURE_ERROR_CAPTURED, n_captured);
+
+  /* Process HTTP retries for this worker */
+  process_http_gpcapng_retries(vlib_get_thread_index());
 
   return frame->n_vectors;
 }

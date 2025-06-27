@@ -9,6 +9,10 @@ gpcapng_main_t *get_gpcapng_main ();
 #include "filter.h"
 #include "destination.h"
 
+typedef struct {
+    worker_dest_index_t wdi;
+    f64 expiry_time;
+} retry_entry_t;
 
 /* Plugin state */
 struct gpcapng_main_t {
@@ -41,6 +45,9 @@ struct gpcapng_main_t {
 
   /* Per-worker bitmaps indicating context readiness for given outputs */
   uword **worker_output_ctx_is_ready;
+
+  /* Per-worker retry management */
+  retry_entry_t **worker_retry_queue;  /* Vector per worker, sorted by expiry_time */
   
   /* Feature arc indices */
   u32 ip4_geneve_input_arc;

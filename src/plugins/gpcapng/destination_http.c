@@ -42,6 +42,14 @@ typedef struct
     /* Statistics */
     u64 total_bytes_sent;
     u64 chunks_sent;
+
+    /* Retry logic */
+    u8 retry_pending;
+    u32 retry_count;
+    f64 next_retry_time;
+    f64 current_timeout;
+    f64 initial_timeout;  /* 0.5 seconds */
+    f64 max_timeout;      /* 30 seconds */
 } http_pcapng_ctx_t;
 
 /* Forward declarations for HTTP client callbacks */
@@ -103,6 +111,108 @@ enable_session_manager (vlib_main_t *vm)
     vlib_worker_thread_barrier_release (vm);
 }
 
+static int
+retry_entry_compare(void *a, void *b)
+{
+    retry_entry_t *ra = (retry_entry_t *)a;
+    retry_entry_t *rb = (retry_entry_t *)b;
+    return (ra->expiry_time < rb->expiry_time) ? -1 :
+           (ra->expiry_time > rb->expiry_time) ? 1 : 0;
+}
+
+
+static void
+schedule_retry(worker_dest_index_t wdi, http_pcapng_ctx_t *ctx)
+{
+    gpcapng_main_t *gpm = get_gpcapng_main();
+    u16 worker_index = wdi_to_worker_index(wdi);
+
+    if (ctx->retry_count >= 10) {  /* Max 10 retries */
+        clib_warning("Max retries exceeded for HTTP destination");
+        return;
+    }
+
+    ctx->retry_pending = 1;
+    ctx->retry_count++;
+    ctx->next_retry_time = vlib_time_now(vlib_get_main()) + ctx->current_timeout;
+
+    /* Exponential backoff, but cap at max_timeout */
+    ctx->current_timeout = clib_min(ctx->current_timeout * 2.0, ctx->max_timeout);
+
+    /* Add to worker's retry queue */
+    vec_validate(gpm->worker_retry_queue, worker_index);
+    retry_entry_t entry = {
+        .wdi = wdi,
+        .expiry_time = ctx->next_retry_time
+    };
+    vec_add1(gpm->worker_retry_queue[worker_index], entry);
+
+    /* Keep queue sorted by expiry time */
+    vec_sort_with_function(gpm->worker_retry_queue[worker_index], retry_entry_compare);
+}
+
+static void
+attempt_reconnect(worker_dest_index_t wdi, http_pcapng_ctx_t *ctx)
+{
+    vnet_connect_args_t connect_args;
+    transport_endpt_ext_cfg_t *ext_cfg;
+    transport_endpt_cfg_http_t http_cfg = { 3600, 0 };
+
+    clib_memset(&connect_args, 0, sizeof(connect_args));
+    ext_cfg = session_endpoint_add_ext_cfg(
+        &connect_args.sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof(http_cfg));
+    clib_memcpy(ext_cfg->data, &http_cfg, sizeof(http_cfg));
+
+    clib_memcpy(&connect_args.sep_ext, &ctx->connect_sep, sizeof(ctx->connect_sep));
+    connect_args.app_index = ctx->app_index;
+    connect_args.api_context = wdi;
+
+    int rv = vnet_connect(&connect_args);
+    if (rv) {
+        /* Connection attempt failed, schedule another retry */
+        schedule_retry(wdi, ctx);
+    } else {
+        ctx->retry_pending = 0;  /* Will be reset in callback if successful */
+    }
+}
+
+void
+process_http_gpcapng_retries(u16 worker_index)
+{
+    gpcapng_main_t *gpm = get_gpcapng_main();
+    f64 now = vlib_time_now(vlib_get_main());
+    int processed = 0;
+
+    if (worker_index >= vec_len(gpm->worker_retry_queue) ||
+        !gpm->worker_retry_queue[worker_index])
+        return;
+
+    retry_entry_t *queue = gpm->worker_retry_queue[worker_index];
+
+    /* Process up to 5 expired entries */
+    while (vec_len(queue) > 0 && processed < 5) {
+        if (queue[0].expiry_time > now)
+            break;  /* Queue is sorted, so we can stop here */
+
+        worker_dest_index_t wdi = queue[0].wdi;
+        http_pcapng_ctx_t *ctx = wdi_to_worker_context(wdi);
+
+        if (ctx && ctx->retry_pending) {
+            attempt_reconnect(wdi, ctx);
+        }
+
+        /* Remove processed entry */
+        vec_delete(queue, 1, 0);
+        processed++;
+    }
+
+    gpm->worker_retry_queue[worker_index] = queue;
+}
+
+
+#define HTTP_INITIAL_TIMEOUT_S 0.5
+#define HTTP_MAX_TIMEOUT_S 30.0
+
 /**
  * Initialize HTTP streaming context for PCAPng capture
  * @param worker_index Worker thread index
@@ -136,6 +246,12 @@ http_pcapng_init (gpcapng_dest_t *output, u16 worker_index, u16 destination_inde
 	clib_mem_free (ctx);
 	return NULL;
     }
+
+    ctx->retry_pending = 0;
+    ctx->retry_count = 0;
+    ctx->initial_timeout = HTTP_INITIAL_TIMEOUT_S;
+    ctx->max_timeout = HTTP_MAX_TIMEOUT_S;
+    ctx->current_timeout = ctx->initial_timeout;
 
     /* Initialize HTTP headers buffer */
     vec_validate (ctx->headers_buf, 4095); /* 4KB for headers */
@@ -211,6 +327,11 @@ http_pcapng_init (gpcapng_dest_t *output, u16 worker_index, u16 destination_inde
     connect_args.app_index = ctx->app_index;
 
     connect_args.api_context = make_wdi(worker_index, destination_index);
+
+    /* Don't connect immediately, let the retry mechanism handle it */
+    schedule_retry(make_wdi(worker_index, destination_index), ctx);
+    return ctx;
+
 
     rv = vnet_connect (&connect_args);
     if (rv)
@@ -467,43 +588,53 @@ static int
 http_pcapng_session_connected_callback (u32 app_index, u32 session_index,
 					session_t *s, session_error_t err)
 {
-  http_pcapng_ctx_t *ctx = NULL;
+    
+    if (err) {
+	clib_warning ("HTTP PCAPng connection failed: %U, FIXME: figure how to schedule callback",
+-                     format_session_error, err);
+        return -1;
 
-  if (err)
-    {
-	clib_warning ("HTTP PCAPng connection failed: %U",
-		      format_session_error, err);
-	return -1;
+        // FIXME: s is zero; the below gets an invalid session... what to do ? 
+        s = session_get (session_index, vlib_get_thread_index());
+        http_pcapng_ctx_t *ctx = wdi_to_worker_context(s->opaque);
+        if (ctx) {
+            schedule_retry(s->opaque, ctx);
+        }
+        return -1;
     }
 
-  ctx = wdi_to_worker_context(s->opaque);
-  if (!ctx)
-    {
-	clib_warning ("No context found for HTTP PCAPng session");
-	return -1;
+    http_pcapng_ctx_t *ctx = wdi_to_worker_context(s->opaque);
+    
+    if (!ctx) {
+        clib_warning ("No context found for HTTP PCAPng session");
+        return -1;
     }
-
-  ctx->session = s;
-  ctx->connected = 1;
-
-  wdi_set_ready_flag(s->opaque, 1);
-
-  clib_warning ("HTTP PCAPng worker %u connected successfully",
-		ctx->worker_index);
-  return 0;
+    
+    /* Reset retry state on successful connection */
+    ctx->retry_pending = 0;
+    ctx->retry_count = 0;
+    ctx->current_timeout = ctx->initial_timeout;
+    
+    ctx->session = s;
+    ctx->connected = 1;
+    wdi_set_ready_flag(s->opaque, 1);
+    
+    return 0;
 }
 
 static void
 http_pcapng_session_disconnect_callback (session_t *s)
 {
-  http_pcapng_ctx_t *ctx = wdi_to_worker_context(s->opaque);
-
-  if (ctx)
-    {
+    http_pcapng_ctx_t *ctx = wdi_to_worker_context(s->opaque);
+    
+    if (ctx) {
         wdi_set_ready_flag(s->opaque, 0);
-	ctx->connected = 0;
-	ctx->session = NULL;
-	clib_warning ("HTTP PCAPng worker %u disconnected", ctx->worker_index);
+        ctx->connected = 0;
+        ctx->session = NULL;
+        
+        /* Schedule retry with shorter timeout for disconnects */
+        ctx->current_timeout = 0.1;  /* 100ms for disconnect retries */
+        schedule_retry(s->opaque, ctx);
     }
 }
 

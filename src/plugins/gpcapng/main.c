@@ -175,6 +175,11 @@ vec_validate (gpm->worker_output_ctx_is_ready, vlib_num_workers());
 for (int i = 0; i <= vlib_num_workers(); i++)
   gpm->worker_output_ctx_is_ready[i] = 0;
 
+  /* Allocate per-worker retry queues */
+vec_validate(gpm->worker_retry_queue, vlib_num_workers());
+for (int i = 0; i <= vlib_num_workers(); i++)
+    gpm->worker_retry_queue[i] = 0;
+
 #ifdef XXXXX
   /* Register for the GENEVE input feature arc */
   gpm->ip4_geneve_input_arc = vlib_node_add_named_next (
